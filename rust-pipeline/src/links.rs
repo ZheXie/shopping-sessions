@@ -135,25 +135,26 @@ unsafe fn compare_names(a: Name, b: Name) -> Ordering {
 
 pub type Edge = (Name, Name);
 
-// Group keys and canonical values in the same cache line. Every probe
-// starts at the beginning of a group and advances only after all four
-// slots are occupied. Lookup can compare four inline IDs together.
+// Keep four immutable alias keys, their root indices, and two full names
+// of otherwise-unlinked people in the same cache line. The keys can still
+// be loaded in one AVX2 operation while workers claim the two extra slots.
 #[repr(C, align(64))]
 struct Group {
     keys: [AtomicU64; 4],
-    people: [AtomicU64; 4],
+    roots: [AtomicU32; 4],
+    unlinked: [AtomicU64; 2],
 }
 
 pub struct Table {
     groups: *mut Group,
     cap: usize,
+    slot_bits: u32,
 }
 unsafe impl Send for Table {}
 unsafe impl Sync for Table {}
 
-// The final lane's person also records whether an insertion continued into
-// the next group. Inline names have seven-bit suffix bytes; indirect names
-// store an input pointer (ADDR) shifted by eight, leaving bit 63 available.
+// The second unlinked slot also records whether an alias insertion continued
+// into the next group. Both inline and indirect names leave bit 63 clear.
 const OVERFLOW: u64 = 1 << 63;
 const GRAIN: usize = 4096;
 const AHEAD: usize = 8;
@@ -174,6 +175,34 @@ impl Table {
     }
 
     #[inline(always)]
+    fn split(&self, root: usize) -> (Name, usize) {
+        let local = (root & ((1 << self.slot_bits) - 1)) as u64 + 1;
+        (local, root >> self.slot_bits)
+    }
+
+    // The terminal probe group is stable after the links freeze. A claimed
+    // name is never evicted, so a miss on two occupied slots always follows
+    // the same ordinary name partition, even across concurrent parsers.
+    #[inline(always)]
+    unsafe fn unlinked(&self, group: usize, raw: Name, fallback: usize) -> (Name, usize) {
+        let g = &*self.groups.add(group);
+        for lane in 0..2 {
+            let cell = &g.unlinked[lane];
+            let mut full = cell.load(Relaxed);
+            if full & !OVERFLOW == 0 {
+                match cell.compare_exchange(full, full | raw, Relaxed, Relaxed) {
+                    Ok(_) => full |= raw,
+                    Err(other) => full = other,
+                }
+            }
+            if same_name(full & !OVERFLOW, raw) {
+                return self.split(self.cap + 2 * group + lane);
+            }
+        }
+        (raw, fallback)
+    }
+
+    #[inline(always)]
     pub unsafe fn route(
         &self, mut group: usize, name: Name, fallback: usize,
     ) -> (Name, usize) {
@@ -187,26 +216,25 @@ impl Table {
                 let keys = _mm256_load_si256(g.keys.as_ptr().cast());
                 let equal = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(name as i64));
                 let mask = _mm256_movemask_pd(_mm256_castsi256_pd(equal));
-                // Lane zero is a readable placeholder when the mask is empty.
-                let lane = mask.trailing_zeros() as usize & 3;
-                if (mask != 0) | (g.people[3].load(Relaxed) & OVERFLOW == 0) {
-                    let found = g.people.get_unchecked(lane).load(Relaxed) & !OVERFLOW;
-                    return if mask != 0 {
-                        (u64::from(found as u32), (found >> 32) as usize)
-                    } else {
-                        (name, fallback)
-                    };
+                if mask != 0 {
+                    let lane = mask.trailing_zeros() as usize;
+                    return self.split(g.roots.get_unchecked(lane).load(Relaxed) as usize);
+                }
+                if g.unlinked[1].load(Relaxed) & OVERFLOW == 0 {
+                    return self.unlinked(group, name, fallback);
                 }
             } else {
                 for lane in 0..4 {
                     let key = g.keys[lane].load(Relaxed);
                     if key == 0 {
-                        return (name, fallback);
+                        return self.unlinked(group, name, fallback);
                     }
                     if same_name(key, name) {
-                        let token = g.people[lane].load(Relaxed) & !OVERFLOW;
-                        return (u64::from(token as u32), (token >> 32) as usize);
+                        return self.split(g.roots[lane].load(Relaxed) as usize);
                     }
+                }
+                if g.unlinked[1].load(Relaxed) & OVERFLOW == 0 {
+                    return self.unlinked(group, name, fallback);
                 }
             }
             group += 1;
@@ -221,21 +249,26 @@ impl Table {
     }
 
     pub fn parts(&self) -> usize {
-        self.cap.div_ceil(1 << self.shift())
+        (self.cap + self.cap / 2).div_ceil(1 << self.shift())
     }
 
     pub fn shift(&self) -> u32 {
-        Self::shift_for(self.cap)
+        self.slot_bits
     }
 
-    // Usually 8192 union-find slots per partition. Scale up for large link
-    // tables to bound the number of parser cursors.
+    // Bound the number of parser cursors, including the two independent
+    // people that each four-slot alias group can now accommodate.
     fn shift_for(cap: usize) -> u32 {
-        cap.div_ceil(4096).next_power_of_two().max(8192).trailing_zeros()
+        (cap + cap / 2).div_ceil(4096).next_power_of_two().max(8192).trailing_zeros()
     }
 
     pub unsafe fn canonical(&self, root: usize) -> Name {
-        self.key(root).load(Relaxed)
+        if root < self.cap {
+            self.key(root).load(Relaxed)
+        } else {
+            let local = root - self.cap;
+            (*self.groups.add(local / 2)).unlinked[local % 2].load(Relaxed) & !OVERFLOW
+        }
     }
 
     #[inline(always)]
@@ -259,7 +292,7 @@ impl Table {
                 return i as u32;
             }
             if i % 4 == 3 {
-                let flag = &(*self.groups.add(i / 4)).people[3];
+                let flag = &(*self.groups.add(i / 4)).unlinked[1];
                 if flag.load(Relaxed) == 0 {
                     flag.store(OVERFLOW, Relaxed);
                 }
@@ -319,6 +352,7 @@ impl Table {
             return Table {
                 groups: std::ptr::null_mut(),
                 cap: 0,
+                slot_bits: Self::shift_for(0),
             };
         }
         let cap = (total * 9 / 4 + 16).next_multiple_of(4);
@@ -327,6 +361,7 @@ impl Table {
         let table = Table {
             groups: anon(bytes) as *mut Group,
             cap,
+            slot_bits: Self::shift_for(cap),
         };
         let parents: Vec<AtomicU32> = (0..cap).map(|_| AtomicU32::new(0)).collect();
         let tasks: Vec<&[Edge]> = edge_lists.iter().flat_map(|v| v.chunks(GRAIN)).collect();
@@ -367,12 +402,7 @@ impl Table {
                 if table.key(s).load(Relaxed) != 0 {
                     let root = Self::find(&parents, s as u32);
                     let group = &*table.groups.add(s / 4);
-                    let dest = &group.people[s % 4];
-                    let shift = Self::shift_for(cap);
-                    let part = root >> shift;
-                    let local = root & ((1u32 << shift) - 1);
-                    let person = (u64::from(part) << 32) | (u64::from(local) + 1);
-                    dest.store(dest.load(Relaxed) | person, Relaxed);
+                    group.roots[s % 4].store(root, Relaxed);
                 }
             }
         });
@@ -411,5 +441,38 @@ mod tests {
         }
         let absent = names[edge_count + 1];
         assert_eq!(resolve(absent), absent);
+    }
+
+    #[test]
+    fn independent_names_share_slots_by_bytes_and_overflow_consistently() {
+        let linked = unsafe { name_of(b"u00000000".as_ptr(), 9) };
+        let table = Table::build(&[vec![(linked, linked)]], 1);
+        let copies: Vec<Vec<u8>> = (0..8).map(|_| b"long individual name,".to_vec()).collect();
+        let barrier = std::sync::Barrier::new(copies.len());
+        let routes = par_map(copies.len(), |i| unsafe {
+            let raw = name_of(copies[i].as_ptr(), copies[i].len() - 1);
+            barrier.wait();
+            table.unlinked(0, raw, usize::MAX)
+        });
+        let (local, part) = routes[0];
+        assert!(part < table.parts());
+        assert!(routes.iter().all(|r| *r == routes[0]));
+        unsafe {
+            let canonical = table.canonical((part << table.shift()) + local as usize - 1);
+            assert_eq!(id_bytes(canonical >> 8), b"long individual name");
+            let second = name_of(b"u00000001".as_ptr(), 9);
+            let third = name_of(b"u00000002".as_ptr(), 9);
+            // An alias probe can cross this group without affecting the saved
+            // independent name or the decision when both slots are occupied.
+            (*table.groups).unlinked[1].fetch_or(OVERFLOW, Relaxed);
+            let (local2, part2) = table.unlinked(0, second, usize::MAX);
+            assert!(part2 < table.parts());
+            assert_ne!((local2, part2), (local, part));
+            assert_eq!(table.canonical((part2 << table.shift()) + local2 as usize - 1), second);
+            for _ in 0..3 {
+                assert_eq!(table.unlinked(0, third, usize::MAX), (third, usize::MAX));
+                assert_eq!(table.unlinked(0, second, usize::MAX), (local2, part2));
+            }
+        }
     }
 }

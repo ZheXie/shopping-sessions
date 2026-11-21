@@ -114,6 +114,7 @@ struct ClStage {
 
 struct Work<'a> {
     slab: Slab<'a>,
+    key_slab: Slab<'a>,
     keys: PartWriter<Key>,
     pays: PartWriter<Pay>,
     clks: PartWriter<Clk>,
@@ -432,7 +433,7 @@ unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
         let part = (s.part >> PART_SHIFT) as usize & ctx.ev_mask;
         w.keys.push(
             part,
-            &mut w.slab,
+            &mut w.key_slab,
             Key {
                 h: s.eh,
                 x: event_key::pack(s.ingest, pay),
@@ -1321,6 +1322,7 @@ fn main() {
         }
     }
     let next = AtomicUsize::new(0);
+    let key_arena = Arena::new();
     let scattered = par_map(threads, |_| {
         let mut sc = Scan::new();
         let mut reader = sys::EventReader::default();
@@ -1340,6 +1342,7 @@ fn main() {
         };
         let mut w = Work {
             slab: Slab::new(&ctx.arena),
+            key_slab: Slab::new(&key_arena),
             keys: PartWriter::new(ev_parts),
             pays: PartWriter::new(person_parts),
             clks: PartWriter::new(person_parts),
@@ -1418,6 +1421,9 @@ fn main() {
             unsafe { dedup_partition(&ctx.arena, blocks, &mut table) };
         }
     });
+    drop(keys);
+    // The last dedup worker has joined and its key pointers are no longer live.
+    unsafe { key_arena.recycle() };
     lap("dedup");
 
     // Start partitions containing large linked people first so their work

@@ -236,6 +236,15 @@ impl Arena {
         }
     }
 
+    /// Hand the allocated slabs to the large-vector allocator after dedup.
+    ///
+    /// # Safety
+    /// Call once, after every worker has stopped using pointers into this arena.
+    pub unsafe fn recycle(self) {
+        RECYCLE_END.store(self.base + self.next.load(Relaxed), Relaxed);
+        RECYCLE_NEXT.store(self.base + HUGE, std::sync::atomic::Ordering::Release);
+    }
+
     fn chunk(&self, bytes: usize) -> usize {
         let at = self.next.fetch_add(bytes, Relaxed);
         assert!(at + bytes <= self.size, "record arena exhausted");
@@ -386,6 +395,8 @@ impl<T: Copy> PartWriter<T> {
 /// Smaller blocks go to the system allocator.
 pub struct HugeAlloc;
 
+static RECYCLE_NEXT: AtomicUsize = AtomicUsize::new(0);
+static RECYCLE_END: AtomicUsize = AtomicUsize::new(0);
 const BIG: usize = 1 << 20;
 const HUGE: usize = 2 << 20;
 
@@ -394,8 +405,25 @@ fn big_len(size: usize) -> usize {
     (size + HUGE - 1) & !(HUGE - 1)
 }
 
-unsafe fn big_map(size: usize) -> *mut u8 {
+unsafe fn big_map(size: usize, zero: bool) -> *mut u8 {
     let len = big_len(size);
+    let mut at = RECYCLE_NEXT.load(std::sync::atomic::Ordering::Acquire);
+    if at != 0 {
+        let end = RECYCLE_END.load(Relaxed);
+        while len <= end - at {
+            match RECYCLE_NEXT.compare_exchange_weak(at, at + len, Relaxed, Relaxed) {
+                Ok(_) => {
+                    let p = at as *mut u8;
+                    // The records still contain event IDs from dedup.
+                    if zero {
+                        p.write_bytes(0, size);
+                    }
+                    return p;
+                }
+                Err(next) => at = next,
+            }
+        }
+    }
     // Over-map by one huge page, then trim so the block is 2 MB aligned.
     let p = libc::mmap(
         null_mut(),
@@ -425,7 +453,7 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     #[inline]
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         if layout.size() >= BIG && layout.align() <= PAGE {
-            big_map(layout.size())
+            big_map(layout.size(), false)
         } else {
             std::alloc::System.alloc(layout)
         }
@@ -433,7 +461,7 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
         if layout.size() >= BIG && layout.align() <= PAGE {
-            big_map(layout.size()) // fresh anonymous memory is zero
+            big_map(layout.size(), true)
         } else {
             std::alloc::System.alloc_zeroed(layout)
         }

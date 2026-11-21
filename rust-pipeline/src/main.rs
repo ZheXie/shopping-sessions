@@ -559,14 +559,63 @@ unsafe fn dedup_partition(arena: &Arena, blocks: &[Blk], table: &mut Vec<u64>) {
     }
 }
 
+/// Per-worker event counts. Common values use their own dictionary index.
+/// A full dictionary can always expand back to PLAIN int32 without losing a row.
+struct Counts {
+    indices: Vec<u16>,
+    values: Vec<i32>,
+    large: HashMap<u32, u16>,
+    plain: Option<Vec<i32>>,
+}
+
+impl Counts {
+    fn new(hint: usize) -> Self {
+        Self {
+            indices: Vec::with_capacity(hint),
+            values: (0..256).collect(),
+            large: HashMap::new(),
+            plain: None,
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, n: u32) {
+        if let Some(plain) = &mut self.plain {
+            plain.push(n as i32);
+        } else if n < 256 {
+            self.indices.push(n as u16);
+        } else {
+            self.large_count(n);
+        }
+    }
+
+    fn large_count(&mut self, n: u32) {
+        if let Some(&index) = self.large.get(&n) {
+            self.indices.push(index);
+        } else if let Ok(index) = u16::try_from(self.values.len()) {
+            self.values.push(n as i32);
+            self.large.insert(n, index);
+            self.indices.push(index);
+        } else {
+            let mut plain: Vec<i32> = std::mem::take(&mut self.indices)
+                .into_iter()
+                .map(|i| self.values[i as usize])
+                .collect();
+            plain.push(n as i32);
+            self.plain = Some(plain);
+        }
+    }
+}
+
 /// One thread's share of both output tables.
 struct Out {
     names: Vec<u8>,
     name_runs: Vec<u8>,
     people: usize,
-    day: Vec<i32>,
-    sessions: Vec<i32>,
-    events: Vec<i32>,
+    day: Vec<u8>,
+    wide_day: Vec<i32>,
+    sessions: Vec<u8>,
+    events: Counts,
     revenue: Vec<i64>,
     top_def: Vec<u8>,
     top: Vec<u8>,
@@ -630,9 +679,10 @@ impl<'a> Agg<'a> {
                     v
                 },
                 people: 0,
-                day: Vec::with_capacity(rows_hint),
+                day: Vec::with_capacity(if ndays <= 256 { rows_hint } else { 0 }),
+                wide_day: Vec::new(),
                 sessions: Vec::with_capacity(rows_hint),
-                events: Vec::with_capacity(rows_hint),
+                events: Counts::new(rows_hint),
                 revenue: Vec::with_capacity(rows_hint),
                 top_def: Vec::with_capacity(rows_hint / 8 + 1),
                 top: Vec::with_capacity(rows_hint * 4),
@@ -833,9 +883,15 @@ impl<'a> Agg<'a> {
     #[inline(always)]
     unsafe fn user_row(&mut self, day: u32, sessions: u32, events: u32, revenue: u64) {
         let o = &mut self.out;
-        o.day.push(self.day0 + day as i32);
-        o.sessions.push(sessions as i32);
-        o.events.push(events as i32);
+        if self.ndays <= 256 {
+            o.day.push(day as u8);
+        } else {
+            o.wide_day.push(self.day0 + day as i32);
+        }
+        // Session starts are more than 30 minutes apart, even between sessions
+        // crossing midnight. No UTC day can hold more than 48 starts per person.
+        o.sessions.push(sessions as u8);
+        o.events.push(events);
         o.revenue.push(revenue as i64);
         if o.rows & 7 == 0 {
             o.top_def.push(0);
@@ -1007,28 +1063,73 @@ impl<'a> Agg<'a> {
     }
 }
 
-fn write_user_file(dir: &Path, index: usize, o: &Out) {
+fn write_user_file(dir: &Path, index: usize, o: &Out, day0: i32, ndays: usize) {
+    // A byte-aligned dictionary bit-pack run directly consumes the compact
+    // in-memory indices. The Parquet hybrid encoding pads the last group to 8.
+    let groups = o.rows.div_ceil(8);
+    let missing = groups * 8 - o.rows;
+    let pad = &[0u8; 7][..missing];
+    let mut run = ((groups as u64) << 1) | 1;
+    let mut header = vec![8];
+    while run >= 128 {
+        header.push((run as u8) | 128);
+        run >>= 7;
+    }
+    header.push(run as u8);
+    let session_values: [i32; 49] = std::array::from_fn(|n| n as i32);
+    let days = if ndays <= 256 {
+        (0..ndays).map(|n| day0 + n as i32).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let day_col = if ndays <= 256 {
+        Col {
+            name: "day",
+            kind: Kind::DictDate(days.len()),
+            parts: vec![bytes_of(&days), &header, &o.day, pad],
+        }
+    } else {
+        Col {
+            name: "day",
+            kind: Kind::Date,
+            parts: vec![bytes_of(&o.wide_day)],
+        }
+    };
+
+    let mut count_header = header.clone();
+    count_header[0] = 16;
+    let count_pad = &[0u8; 14][..2 * missing];
+    let counts = if let Some(plain) = &o.events.plain {
+        Col {
+            name: "events",
+            kind: Kind::I32,
+            parts: vec![bytes_of(plain)],
+        }
+    } else {
+        Col {
+            name: "events",
+            kind: Kind::DictInt(o.events.values.len()),
+            parts: vec![
+                bytes_of(&o.events.values),
+                &count_header,
+                bytes_of(&o.events.indices),
+                count_pad,
+            ],
+        }
+    };
     let cols = [
         Col {
             name: "user_id",
             kind: Kind::DictStr(o.people),
             parts: vec![&o.names, &o.name_runs],
         },
-        Col {
-            name: "day",
-            kind: Kind::Date,
-            parts: vec![bytes_of(&o.day)],
-        },
+        day_col,
         Col {
             name: "sessions",
-            kind: Kind::I32,
-            parts: vec![bytes_of(&o.sessions)],
+            kind: Kind::DictInt(session_values.len()),
+            parts: vec![bytes_of(&session_values), &header, &o.sessions, pad],
         },
-        Col {
-            name: "events",
-            kind: Kind::I32,
-            parts: vec![bytes_of(&o.events)],
-        },
+        counts,
         Col {
             name: "revenue_cents",
             kind: Kind::I64,
@@ -1336,7 +1437,7 @@ fn main() {
             unsafe { agg.partition(&pays[part], &clks[part]) };
         }
         if agg.out.rows > 0 || t == 0 {
-            write_user_file(&user_dir, t, &agg.out);
+            write_user_file(&user_dir, t, &agg.out, agg.day0, agg.ndays);
         }
         (agg.out.rows, std::mem::take(&mut agg.out.camp))
     });
@@ -1373,4 +1474,20 @@ fn main() {
     eprintln!("wrote user_daily={user_rows} campaign_daily={camp_rows} threads={threads}");
     // Everything still mapped is reclaimed faster by the kernel than by us.
     std::process::exit(0);
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::Counts;
+
+    #[test]
+    fn full_count_dictionary_expands_existing_rows_and_accepts_more() {
+        let mut column = Counts::new(0);
+        let high = u32::from(u16::MAX);
+        let counts = (0..=high + 1).chain([123_456_789, 255, 999]);
+        for value in counts.clone() {
+            column.push(value);
+        }
+        assert!(column.plain.unwrap().into_iter().eq(counts.map(|v| v as i32)));
+    }
 }

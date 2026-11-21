@@ -13,6 +13,8 @@ pub enum Kind {
     Str,
     /// Number of distinct values, followed in `parts` by their PLAIN bytes and the index stream.
     DictStr(usize),
+    DictInt(usize),
+    DictDate(usize),
     /// Nullable string: the payload is the definition levels as one bit per
     /// row (LSB first), then the PLAIN values of the non-null rows.
     OptStr,
@@ -117,7 +119,7 @@ const ENC_RLE_DICTIONARY: i32 = 8;
 
 fn physical(kind: Kind) -> i32 {
     match kind {
-        Kind::I32 | Kind::Date => TYPE_INT32,
+        Kind::I32 | Kind::Date | Kind::DictInt(_) | Kind::DictDate(_) => TYPE_INT32,
         Kind::I64 => TYPE_INT64,
         Kind::Str | Kind::DictStr(_) | Kind::OptStr => TYPE_BYTE_ARRAY,
     }
@@ -139,7 +141,9 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Col]) {
             let mut encoding = ENC_PLAIN;
             let mut prefix: Vec<u8> = Vec::new();
             let mut parts: &[&[u8]] = &col.parts;
-            if let Kind::DictStr(entries) = col.kind {
+            if let Kind::DictStr(entries) | Kind::DictInt(entries) | Kind::DictDate(entries) =
+                col.kind
+            {
                 let dictionary = parts[0];
                 let size = i32::try_from(dictionary.len()).expect("dictionary page too large");
                 let mut header = Thrift::new();
@@ -217,7 +221,7 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Col]) {
                 m.end();
                 m.end();
             }
-            Kind::Date => {
+            Kind::Date | Kind::DictDate(_) => {
                 m.i32(6, 6);
                 m.begin_field(10);
                 m.begin_field(6);
@@ -238,7 +242,10 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Col]) {
             m.i64(2, start as i64);
             m.begin_field(3);
             m.i32(1, physical(col.kind));
-            let dictionary = matches!(col.kind, Kind::DictStr(_));
+            let dictionary = matches!(
+                col.kind,
+                Kind::DictStr(_) | Kind::DictDate(_) | Kind::DictInt(_)
+            );
             m.list(2, T_I32, if dictionary { 3 } else { 2 });
             m.zigzag(ENC_PLAIN as i64);
             m.zigzag(ENC_RLE as i64);

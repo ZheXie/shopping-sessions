@@ -1,32 +1,30 @@
 IMAGE ?= shopping-sessions:latest
-CPUS  ?= 8
-MEM   ?= 24g
-# The scorer's platform. PLATFORM=linux/arm64 builds and runs natively on an Apple-silicon Mac, for fast local loops.
-PLATFORM ?= linux/amd64
-DEV   ?= dev
-# In the monorepo the fixtures live two levels up; the published starter has its own copy.
-FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
-export IMAGE CPUS MEM PLATFORM
+CXXFLAGS ?= -O3 -march=x86-64-v3 -std=c++17 -pthread
+BIN ?= build/ss
+DEV ?= dev
+ANSWER ?= dev-answer
 
-.PHONY: build fixtures dev run-dev check-dev
+.PHONY: bin fixtures check-dev fuzz build run-dev
 
-## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
+## Native build (Linux, g++ 11+)
+bin:
+	mkdir -p build && g++ $(CXXFLAGS) -o $(BIN) src/ss.cpp
+
+## All 36 edge-case fixtures (needs polars for the checker)
+fixtures: bin
+	python3 scripts/run_fixtures.py fixtures -- $(BIN)
+
+## Run on the 1M dev set and diff with the published answer
+check-dev: bin
+	rm -rf out && $(BIN) $(DEV) out && python3 scripts/compare.py out $(ANSWER)
+
+## Differential fuzz against the slow reference (needs polars, pyarrow)
+fuzz: bin
+	COMPARE=scripts/compare.py python3 reference/fuzz.py $(BIN) 500
+
+## Docker image exactly as the scorer builds it
 build:
-	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) .
+	docker buildx build --platform linux/amd64 --load -t $(IMAGE) .
 
-## Run the image on all 36 edge-case fixtures and diff against the expected tables
-fixtures: build
-	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
-
-## Make the 1M-event dev set with the published generator (needs `generate` on PATH)
-dev:
-	generate --seed 1 --events 1000000 --clicks 250000 --output $(DEV)
-
-## Run on the dev set with scorer flags and time it
 run-dev: build
 	rm -rf out && time scripts/docker_run.sh $(DEV) out
-
-## Compare your dev output with the published dev answer (dev-answer.zip, unzipped): make check-dev ANSWER=dev-answer
-ANSWER ?= dev-answer
-check-dev:
-	python3 scripts/compare.py out $(ANSWER)

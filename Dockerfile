@@ -1,23 +1,15 @@
-# Shopping Sessions starter: Polars skeleton.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
-FROM python:3.12-slim-bookworm
+# Shopping Sessions: C++ pipeline, one static binary.
+# Build stage compiles with the scorer's CPU baseline (x86-64-v3: AVX2, BMI2;
+# the Cascade Lake scorers support it). The run image holds only the binary.
+FROM debian:bookworm-slim AS build
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends g++ libc6-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY src/ss.cpp .
+RUN g++ -O3 -march=x86-64-v3 -std=c++17 -pthread -static -o /ss ss.cpp
 
-# The scorer runs the container as uid 1000; give that uid a name and a home.
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
-COPY pipeline/ /app/pipeline/
-COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
-
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-WORKDIR /app
-CMD ["/app/run.sh"]
+FROM scratch
+COPY --from=build /ss /ss
+# Runs as uid 1000 with a read-only root; reads $DATA_DIR, writes $OUTPUT_DIR.
+CMD ["/ss"]

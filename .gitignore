@@ -17,3 +17,6 @@ target/
 .DS_Store
 .idea/
 .vscode/
+
+# C++ build
+build/

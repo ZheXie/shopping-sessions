@@ -17,6 +17,7 @@ mod dim;
 mod event_key;
 mod hashx;
 mod links;
+mod linked_pay;
 mod pq;
 mod scan;
 mod sys;
@@ -34,6 +35,7 @@ use click::Click;
 use dense_sessions::DenseSessions;
 use dim::SmallTab;
 use hashx::{r4, r8};
+use linked_pay::LinkedPay;
 use links::{name_hash, same_name, Edge, Name, Table};
 use pq::{bytes_of, Col, Kind};
 use scan::Scan;
@@ -92,6 +94,9 @@ struct Ctx {
     cat_bits: u32,
     ev_mask: usize,
     person_mask: usize,
+    linked_parts: usize,
+    linked_pay: LinkedPay,
+    small_link_table: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -117,6 +122,7 @@ struct Work<'a> {
     key_slab: Slab<'a>,
     keys: PartWriter<Key>,
     pays: PartWriter<Pay>,
+    compact: PartWriter<u64>,
     clks: PartWriter<Clk>,
     ev: [EvStage; BATCH],
     nev: usize,
@@ -425,9 +431,13 @@ unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
         let s = *w.ev.get_unchecked(i);
         let mut pay = 0u64;
         if s.valid {
-            let name = ctx.links.lookup(s.link_group, s.name);
-            let part = (name_hash(name).rotate_left(24) >> PART_SHIFT) as usize & ctx.person_mask;
-            let at = w.pays.push(part, &mut w.slab, Pay { name, w: s.tp });
+            let (name, part) = route(ctx, s.link_group, s.name);
+            let at = if part < ctx.linked_parts {
+                let encoded = ctx.linked_pay.encode(name - 1, s.tp, &mut w.slab, &ctx.arena);
+                w.compact.push(part, &mut w.slab, encoded)
+            } else {
+                w.pays.push(part - ctx.linked_parts, &mut w.slab, Pay { name, w: s.tp })
+            };
             pay = ((at - ctx.arena.base) / Arena::UNIT) as u64;
         }
         let part = (s.part >> PART_SHIFT) as usize & ctx.ev_mask;
@@ -486,8 +496,7 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, source: *const u8,
 unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
     for i in 0..w.ncl {
         let s = *w.cl.get_unchecked(i);
-        let name = ctx.links.lookup(s.link_group, s.name);
-        let part = (name_hash(name).rotate_left(24) >> PART_SHIFT) as usize & ctx.person_mask;
+        let (name, part) = route(ctx, s.link_group, s.name);
         w.clks.push(
             part,
             &mut w.slab,
@@ -498,6 +507,15 @@ unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
         );
     }
     w.ncl = 0;
+}
+
+#[inline(always)]
+unsafe fn route(ctx: &Ctx, group: usize, raw: Name) -> (Name, usize) {
+    // A tiny links file can accompany arbitrarily large event files.
+    // Its group number has too few bits to balance unlinked people then.
+    let hash = if ctx.small_link_table { (name_hash(raw) >> 32) as usize } else { group };
+    let fallback = ctx.linked_parts + (hash & ctx.person_mask);
+    ctx.links.route(group, raw, fallback)
 }
 
 /// Blocks of a partition are scattered, so the hardware prefetcher loses the
@@ -525,7 +543,7 @@ unsafe fn dedup_partition(arena: &Arena, blocks: &[Blk], table: &mut Vec<u64>) {
     let kill = |x: u64| {
         let at = event_key::payload(x);
         if at != 0 {
-            (*((arena.base + at * Arena::UNIT) as *mut Pay)).name = 0;
+            ((arena.base + at * Arena::UNIT) as *mut u64).write(0);
         }
     };
     for (b, blk) in blocks.iter().enumerate() {
@@ -820,10 +838,79 @@ impl<'a> Agg<'a> {
             *self.cks.get_unchecked_mut(*at as usize) = *self.ck_raw.get_unchecked(i);
             *at += 1;
         }
+        self.consume::<false>(people, 0);
+    }
+
+    /// The union-find slot is unique for a linked person. Two sequential
+    /// passes count and scatter directly without building a name table.
+    unsafe fn linked_partition(&mut self, part: usize, pays: &[Blk], clks: &[Blk]) {
+        if pays.is_empty() {
+            return;
+        }
+        let layout = self.ctx.linked_pay;
+        let span = layout.span();
+        self.ev_end.clear();
+        self.ev_end.resize(span, 0);
+        self.ck_end.clear();
+        self.ck_end.resize(span, 0);
+        for (b, blk) in pays.iter().enumerate() {
+            prefetch_block(pays.get(b + 1));
+            for &p in std::slice::from_raw_parts(blk.ptr as *const u64, blk.n as usize) {
+                if p != 0 {
+                    *self.ev_end.get_unchecked_mut(layout.index(p)) += 1;
+                }
+            }
+        }
+        for (b, blk) in clks.iter().enumerate() {
+            prefetch_block(clks.get(b + 1));
+            for c in std::slice::from_raw_parts(blk.ptr as *const Clk, blk.n as usize) {
+                *self.ck_end.get_unchecked_mut(c.name as usize - 1) += 1;
+            }
+        }
+        let (mut nev, mut nck) = (0, 0);
+        for (ev, ck) in self.ev_end.iter_mut().zip(&mut self.ck_end) {
+            let (ev_count, ck_count) = (*ev, *ck);
+            *ev = nev;
+            *ck = nck;
+            nev += ev_count;
+            nck += ck_count;
+        }
+        if self.evs.len() < nev as usize {
+            self.evs.resize(nev as usize, 0);
+        }
+        if self.cks.len() < nck as usize {
+            self.cks.resize(nck as usize, Click::default());
+        }
+        for (b, blk) in pays.iter().enumerate() {
+            prefetch_block(pays.get(b + 1));
+            for &p in std::slice::from_raw_parts(blk.ptr as *const u64, blk.n as usize) {
+                if p != 0 {
+                    let at = self.ev_end.get_unchecked_mut(layout.index(p));
+                    *self.evs.get_unchecked_mut(*at as usize) = layout.word(p, &self.ctx.arena);
+                    *at += 1;
+                }
+            }
+        }
+        for (b, blk) in clks.iter().enumerate() {
+            prefetch_block(clks.get(b + 1));
+            for c in std::slice::from_raw_parts(blk.ptr as *const Clk, blk.n as usize) {
+                let at = self.ck_end.get_unchecked_mut(c.name as usize - 1);
+                *self.cks.get_unchecked_mut(*at as usize) = c.click;
+                *at += 1;
+            }
+        }
+        self.consume::<true>(span, part * span);
+    }
+
+    unsafe fn consume<const DIRECT: bool>(&mut self, people: usize, root_begin: usize) {
         let (mut ev_at, mut ck_at) = (0usize, 0usize);
         for p in 0..people {
             let ev_to = *self.ev_end.get_unchecked(p) as usize;
             let ck_end = *self.ck_end.get_unchecked(p) as usize;
+            if ev_to == ev_at {
+                ck_at = ck_end;
+                continue;
+            }
             let events = &mut self.evs[ev_at..ev_to];
             let dense = events.len() >= 256 && self.ctx.wlen < 1 << 33;
             if dense {
@@ -851,7 +938,11 @@ impl<'a> Agg<'a> {
             } else if clicks.len() > 1 {
                 clicks.sort_unstable_by_key(|c| c.time());
             }
-            let name = *self.names.get_unchecked(p);
+            let name = if DIRECT {
+                self.ctx.links.canonical(root_begin + p)
+            } else {
+                *self.names.get_unchecked(p)
+            };
             if dense {
                 self.person::<true>(name, ev_at, ev_to, ck_at, ck_to);
             } else {
@@ -1288,6 +1379,11 @@ fn main() {
     let per_part = env_usize("SS_PART_ROWS").unwrap_or(50_000).max(1);
     let ev_parts = parts_for(event_bytes / 80, per_part);
     let person_parts = parts_for(event_bytes / 80 + click_bytes / 50, per_part);
+    let unlinked_parts = (person_parts / 2).max(1);
+    let linked_parts = links.parts();
+    let person_parts = unlinked_parts + linked_parts;
+    let linked_pay = LinkedPay::new(links.shift(), wlen, cat_bits);
+    let small_link_table = links.groups() < unlinked_parts;
     let ctx = Ctx {
         arena: Arena::new(),
         w0,
@@ -1299,7 +1395,10 @@ fn main() {
         unknown,
         cat_bits,
         ev_mask: ev_parts - 1,
-        person_mask: person_parts - 1,
+        person_mask: unlinked_parts - 1,
+        linked_parts,
+        linked_pay,
+        small_link_table,
     };
 
     // Parse and scatter.
@@ -1344,7 +1443,8 @@ fn main() {
             slab: Slab::new(&ctx.arena),
             key_slab: Slab::new(&key_arena),
             keys: PartWriter::new(ev_parts),
-            pays: PartWriter::new(person_parts),
+            pays: PartWriter::new(unlinked_parts),
+            compact: PartWriter::new(linked_parts),
             clks: PartWriter::new(person_parts),
             ev: [blank_ev; BATCH],
             nev: 0,
@@ -1397,7 +1497,9 @@ fn main() {
                 }
             }
         }
-        (w.keys.finish(), w.pays.finish(), w.clks.finish())
+        let mut pays = w.compact.finish();
+        pays.extend(w.pays.finish());
+        (w.keys.finish(), pays, w.clks.finish())
     });
     let (mut keys, mut pays, mut clks) = (Vec::new(), Vec::new(), Vec::new());
     for (k, p, c) in scattered {
@@ -1441,7 +1543,13 @@ fn main() {
             let Some(&part) = order.get(next.fetch_add(1, Relaxed)) else {
                 break;
             };
-            unsafe { agg.partition(&pays[part], &clks[part]) };
+            unsafe {
+                if part < linked_parts {
+                    agg.linked_partition(part, &pays[part], &clks[part]);
+                } else {
+                    agg.partition(&pays[part], &clks[part]);
+                }
+            }
         }
         // Every Pay and Clk has been consumed. Parquet columns and
         // campaign totals own their data independently of the record arena.

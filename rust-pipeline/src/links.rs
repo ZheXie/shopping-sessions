@@ -174,9 +174,11 @@ impl Table {
     }
 
     #[inline(always)]
-    pub unsafe fn lookup(&self, mut group: usize, name: Name) -> Name {
+    pub unsafe fn route(
+        &self, mut group: usize, name: Name, fallback: usize,
+    ) -> (Name, usize) {
         if self.cap == 0 {
-            return name;
+            return (name, fallback);
         }
         loop {
             let g = &*self.groups.add(group);
@@ -189,16 +191,21 @@ impl Table {
                 let lane = mask.trailing_zeros() as usize & 3;
                 if (mask != 0) | (g.people[3].load(Relaxed) & OVERFLOW == 0) {
                     let found = g.people.get_unchecked(lane).load(Relaxed) & !OVERFLOW;
-                    return if mask != 0 { found } else { name };
+                    return if mask != 0 {
+                        (u64::from(found as u32), (found >> 32) as usize)
+                    } else {
+                        (name, fallback)
+                    };
                 }
             } else {
                 for lane in 0..4 {
                     let key = g.keys[lane].load(Relaxed);
                     if key == 0 {
-                        return name;
+                        return (name, fallback);
                     }
                     if same_name(key, name) {
-                        return g.people[lane].load(Relaxed) & !OVERFLOW;
+                        let token = g.people[lane].load(Relaxed) & !OVERFLOW;
+                        return (u64::from(token as u32), (token >> 32) as usize);
                     }
                 }
             }
@@ -207,6 +214,28 @@ impl Table {
                 group = 0;
             }
         }
+    }
+
+    pub fn groups(&self) -> usize {
+        self.cap / 4
+    }
+
+    pub fn parts(&self) -> usize {
+        self.cap.div_ceil(1 << self.shift())
+    }
+
+    pub fn shift(&self) -> u32 {
+        Self::shift_for(self.cap)
+    }
+
+    // Usually 8192 union-find slots per partition. Scale up for large link
+    // tables to bound the number of parser cursors.
+    fn shift_for(cap: usize) -> u32 {
+        cap.div_ceil(4096).next_power_of_two().max(8192).trailing_zeros()
+    }
+
+    pub unsafe fn canonical(&self, root: usize) -> Name {
+        self.key(root).load(Relaxed)
     }
 
     #[inline(always)]
@@ -339,7 +368,10 @@ impl Table {
                     let root = Self::find(&parents, s as u32);
                     let group = &*table.groups.add(s / 4);
                     let dest = &group.people[s % 4];
-                    let person = table.key(root as usize).load(Relaxed);
+                    let shift = Self::shift_for(cap);
+                    let part = root >> shift;
+                    let local = root & ((1u32 << shift) - 1);
+                    let person = (u64::from(part) << 32) | (u64::from(local) + 1);
                     dest.store(dest.load(Relaxed) | person, Relaxed);
                 }
             }
@@ -366,7 +398,14 @@ mod tests {
             .collect();
         let edges = names[1..=edge_count].iter().map(|&name| (names[0], name)).collect();
         let table = Table::build(&[edges], 1);
-        let resolve = |name| unsafe { table.lookup(table.prefetch(name_hash(name)), name) };
+        let resolve = |name| unsafe {
+            let (local, part) = table.route(table.prefetch(name_hash(name)), name, usize::MAX);
+            if part == usize::MAX {
+                name
+            } else {
+                table.canonical((part << table.shift()) + local as usize - 1)
+            }
+        };
         for &name in &names[..=edge_count] {
             assert_eq!(resolve(name), names[0]);
         }

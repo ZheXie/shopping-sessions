@@ -285,6 +285,11 @@ impl<'a> Slab<'a> {
     }
 
     #[inline(always)]
+    pub fn base(&self) -> usize {
+        self.arena.base
+    }
+
+    #[inline(always)]
     pub fn alloc(&mut self, bytes: usize) -> usize {
         if self.end - self.cur < bytes {
             self.grow(bytes);

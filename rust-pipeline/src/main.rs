@@ -34,6 +34,7 @@ use std::time::Instant;
 use click::Click;
 use dense_sessions::DenseSessions;
 use dim::SmallTab;
+use event_key::Key;
 use hashx::{r4, r8};
 use linked_pay::LinkedPay;
 use links::{name_hash, same_name, Edge, Name, Table};
@@ -55,14 +56,6 @@ const MAX_PARTS: usize = 4096;
 const BATCH: usize = 32;
 const NONE: u32 = u32::MAX;
 
-/// Exact event key and packed (ingest second, payload offset).
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Key {
-    h: u64,
-    x: u64,
-}
-
 /// Dedup clears `name` when another copy outranks this event. Sorting
 /// the packed (relative time, price, category) word orders events by time.
 #[repr(C)]
@@ -80,6 +73,7 @@ struct Clk {
 }
 
 struct Ctx {
+    key_layout: event_key::Layout,
     arena: Arena,
     w0: i64,
     ingest_origin: i64,
@@ -376,7 +370,7 @@ unsafe fn event_row(
     if ingest == ts::BAD {
         return;
     }
-    let (eh, eh2) = event_key::encode(
+    let (eh, eh2) = ctx.key_layout.identify(
         base.add(b0 as usize),
         (e0 - b0) as usize,
         source.add(b0 as usize),
@@ -440,15 +434,8 @@ unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
             };
             pay = ((at - ctx.arena.base) / Arena::UNIT) as u64;
         }
-        let part = (s.part >> PART_SHIFT) as usize & ctx.ev_mask;
-        w.keys.push(
-            part,
-            &mut w.key_slab,
-            Key {
-                h: s.eh,
-                x: event_key::pack(s.ingest, pay),
-            },
-        );
+        let key = ctx.key_layout.pack(s.eh, s.part, s.ingest, pay, &mut w.key_slab);
+        w.keys.push(s.part as usize & ctx.ev_mask, &mut w.key_slab, key);
     }
     w.nev = 0;
 }
@@ -530,7 +517,9 @@ unsafe fn prefetch_block(blk: Option<&Blk>) {
 }
 
 /// Marks every copy of an event but the one with the smallest `ingest_ts`.
-unsafe fn dedup_partition(arena: &Arena, blocks: &[Blk], table: &mut Vec<u64>) {
+unsafe fn dedup_partition(
+    key_base: usize, layout: event_key::Layout, arena: &Arena, blocks: &[Blk], table: &mut Vec<u64>,
+) {
     let n: usize = blocks.iter().map(|b| b.n as usize).sum();
     let cap = (n * 2).next_power_of_two().max(64);
     if table.len() < cap {
@@ -540,8 +529,8 @@ unsafe fn dedup_partition(arena: &Arena, blocks: &[Blk], table: &mut Vec<u64>) {
     tab.fill(0);
     let mask = cap - 1;
     let tab = tab.as_mut_ptr();
-    let kill = |x: u64| {
-        let at = event_key::payload(x);
+    let kill = |k: Key| {
+        let at = k.payload();
         if at != 0 {
             ((arena.base + at * Arena::UNIT) as *mut u64).write(0);
         }
@@ -551,23 +540,24 @@ unsafe fn dedup_partition(arena: &Arena, blocks: &[Blk], table: &mut Vec<u64>) {
         let base = blk.ptr as *const Key;
         for i in 0..blk.n as usize {
             let k = base.add(i);
-            let h = event_key::probe((*k).h);
-            let entry = ((k as u64) << 16) | (h & 0xFFFF);
-            let mut slot = (h >> 16) as usize & mask;
+            let h = (*k).hash();
+            let tag = u64::from(h >> 16);
+            let entry = ((k as u64) << 16) | tag;
+            let mut slot = h as usize & mask;
             loop {
                 let e = *tab.add(slot);
                 if e == 0 {
                     *tab.add(slot) = entry;
                     break;
                 }
-                if (e ^ h) & 0xFFFF == 0 {
+                if (e ^ tag) & 0xFFFF == 0 {
                     let o = (e >> 16) as *const Key;
-                    if event_key::equal((*o).h, (*k).h) {
-                        if event_key::earlier((*k).x, (*o).x) {
-                            kill((*o).x);
+                    if layout.equals(*o, *k, key_base) {
+                        if layout.earlier(*k, *o, key_base) {
+                            kill(*o);
                             *tab.add(slot) = entry;
                         } else {
-                            kill((*k).x);
+                            kill(*k);
                         }
                         break;
                     }
@@ -1377,17 +1367,20 @@ fn main() {
     let event_bytes: usize = event_files.iter().map(|(_, b)| b.len).sum();
     let click_bytes: usize = click_files.iter().map(|(_, b)| b.len).sum();
     let per_part = env_usize("SS_PART_ROWS").unwrap_or(50_000).max(1);
-    let ev_parts = parts_for(event_bytes / 80, per_part);
+    let min_parts = event_key::Layout::min_parts(wlen);
+    let ev_parts = parts_for(event_bytes / 80, per_part).max(min_parts);
     let person_parts = parts_for(event_bytes / 80 + click_bytes / 50, per_part);
     let unlinked_parts = (person_parts / 2).max(1);
     let linked_parts = links.parts();
     let person_parts = unlinked_parts + linked_parts;
     let linked_pay = LinkedPay::new(links.shift(), wlen, cat_bits);
     let small_link_table = links.groups() < unlinked_parts;
+    let key_layout = event_key::Layout::new(ev_parts);
     let ctx = Ctx {
+        key_layout,
         arena: Arena::new(),
         w0,
-        ingest_origin: w0.div_euclid(1000) - (1 << 31),
+        ingest_origin: w0.div_euclid(1000) - key_layout.padding(wlen),
         wlen,
         links,
         products,
@@ -1520,7 +1513,7 @@ fn main() {
             let Some(blocks) = keys.get(next.fetch_add(1, Relaxed)) else {
                 break;
             };
-            unsafe { dedup_partition(&ctx.arena, blocks, &mut table) };
+            unsafe { dedup_partition(key_arena.base, ctx.key_layout, &ctx.arena, blocks, &mut table) };
         }
     });
     drop(keys);

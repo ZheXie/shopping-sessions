@@ -1,6 +1,7 @@
 //! Timestamps: F1 `2026-10-03T23:58:10Z`, F2 `...+HH:MM`, F3 epoch millis.
 
 use crate::hashx::r8;
+use std::arch::x86_64::*;
 
 pub const BAD: i64 = i64::MIN;
 pub const DAY_MS: i64 = 86_400_000;
@@ -99,6 +100,9 @@ impl Dates {
     /// Epoch milliseconds, or `BAD`. Needs 25 readable bytes at `p`.
     #[inline(always)]
     pub unsafe fn parse(&mut self, p: *const u8, len: usize) -> i64 {
+        if len == 13 {
+            return thirteen(p);
+        }
         if len == 20 {
             if *p.add(19) == b'Z' {
                 return self.datetime(p);
@@ -134,6 +138,26 @@ impl Dates {
             local + offset
         }
     }
+}
+
+/// A 13-digit millisecond epoch in two groups of eight digits.
+#[inline(always)]
+unsafe fn thirteen(p: *const u8) -> i64 {
+    let digits = _mm_xor_si128(_mm_loadu_si128(p.cast()), _mm_set1_epi8(b'0' as i8));
+    let invalid = _mm_or_si128(digits, _mm_add_epi8(digits, _mm_set1_epi8(0x76)));
+    if _mm_movemask_epi8(invalid) & 0x1fff != 0 {
+        return BAD;
+    }
+    // Left-pad to 16 digits. Each multiply-add groups two adjacent decimal
+    // values, first digits, then pairs, then four-digit values.
+    let padded = _mm_slli_si128::<3>(digits);
+    let pairs = _mm_maddubs_epi16(padded, _mm_set1_epi16(0x010a));
+    let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0064));
+    let packed = _mm_packs_epi32(quads, quads);
+    let octets = _mm_madd_epi16(packed, _mm_set1_epi32(0x0001_2710));
+    let leading = _mm_cvtsi128_si32(octets) as i64;
+    let trailing = _mm_extract_epi32::<1>(octets) as i64;
+    leading * 100_000_000 + trailing
 }
 
 /// Eight ASCII digits at `p`, or `u64::MAX`.

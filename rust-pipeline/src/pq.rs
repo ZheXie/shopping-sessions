@@ -1,5 +1,5 @@
-//! Minimal Parquet writer: one row group, one PLAIN uncompressed v1 data page
-//! per column. Callers hand over each column already PLAIN-encoded.
+//! Minimal Parquet writer: one row group, one uncompressed v1 data page per column.
+//! Strings can use an additional dictionary page with RLE indices.
 
 use std::fs::File;
 use std::io::Write;
@@ -11,6 +11,8 @@ pub enum Kind {
     I64,
     Date,
     Str,
+    /// Number of distinct values, followed in `parts` by their PLAIN bytes and the index stream.
+    DictStr(usize),
     /// Nullable string: the payload is the definition levels as one bit per
     /// row (LSB first), then the PLAIN values of the non-null rows.
     OptStr,
@@ -111,12 +113,13 @@ const TYPE_INT64: i32 = 2;
 const TYPE_BYTE_ARRAY: i32 = 6;
 const ENC_PLAIN: i32 = 0;
 const ENC_RLE: i32 = 3;
+const ENC_RLE_DICTIONARY: i32 = 8;
 
 fn physical(kind: Kind) -> i32 {
     match kind {
         Kind::I32 | Kind::Date => TYPE_INT32,
         Kind::I64 => TYPE_INT64,
-        Kind::Str | Kind::OptStr => TYPE_BYTE_ARRAY,
+        Kind::Str | Kind::DictStr(_) | Kind::OptStr => TYPE_BYTE_ARRAY,
     }
 }
 
@@ -128,12 +131,35 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Col]) {
     let mut file = File::create(path).unwrap_or_else(|e| panic!("create {}: {e}", path.display()));
     write_all(&mut file, b"PAR1");
     let mut offset = 4u64;
-    // (page offset, chunk size) per column.
-    let mut chunks: Vec<(u64, u64)> = Vec::with_capacity(cols.len());
+    // (column start, data page offset, chunk size) per column.
+    let mut chunks: Vec<(u64, u64, u64)> = Vec::with_capacity(cols.len());
     if rows > 0 {
         for col in cols {
+            let start = offset;
+            let mut encoding = ENC_PLAIN;
             let mut prefix: Vec<u8> = Vec::new();
             let mut parts: &[&[u8]] = &col.parts;
+            if let Kind::DictStr(entries) = col.kind {
+                let dictionary = parts[0];
+                let size = i32::try_from(dictionary.len()).expect("dictionary page too large");
+                let mut header = Thrift::new();
+                header.i32(1, 2); // DICTIONARY_PAGE
+                header.i32(2, size);
+                header.i32(3, size);
+                header.begin_field(7);
+                header.i32(
+                    1,
+                    i32::try_from(entries).expect("too many dictionary entries"),
+                );
+                header.i32(2, ENC_PLAIN);
+                header.end();
+                header.buf.push(0);
+                write_all(&mut file, &header.buf);
+                write_all(&mut file, dictionary);
+                offset += (header.buf.len() + dictionary.len()) as u64;
+                encoding = ENC_RLE_DICTIONARY;
+                parts = &parts[1..];
+            }
             if col.kind == Kind::OptStr {
                 // RLE/bit-packed hybrid, bit width 1: a single bit-packed run.
                 let groups = rows.div_ceil(8);
@@ -153,7 +179,7 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Col]) {
             h.i32(3, size as i32);
             h.begin_field(5);
             h.i32(1, rows as i32);
-            h.i32(2, ENC_PLAIN);
+            h.i32(2, encoding);
             h.i32(3, ENC_RLE);
             h.i32(4, ENC_RLE);
             h.end();
@@ -164,8 +190,9 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Col]) {
                 write_all(&mut file, p);
             }
             let chunk = (h.buf.len() + size) as u64;
-            chunks.push((offset, chunk));
+            let data_page = offset;
             offset += chunk;
+            chunks.push((start, data_page, offset - start));
         }
     }
 
@@ -183,7 +210,7 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Col]) {
         m.i32(3, if col.kind == Kind::OptStr { 1 } else { 0 });
         m.string(4, col.name);
         match col.kind {
-            Kind::Str | Kind::OptStr => {
+            Kind::Str | Kind::DictStr(_) | Kind::OptStr => {
                 m.i32(6, 0);
                 m.begin_field(10);
                 m.begin_field(1);
@@ -206,14 +233,18 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Col]) {
         m.list(4, T_STRUCT, 1);
         m.begin();
         m.list(1, T_STRUCT, cols.len());
-        for (col, &(page, size)) in cols.iter().zip(&chunks) {
+        for (col, &(start, page, size)) in cols.iter().zip(&chunks) {
             m.begin();
-            m.i64(2, page as i64);
+            m.i64(2, start as i64);
             m.begin_field(3);
             m.i32(1, physical(col.kind));
-            m.list(2, T_I32, 2);
+            let dictionary = matches!(col.kind, Kind::DictStr(_));
+            m.list(2, T_I32, if dictionary { 3 } else { 2 });
             m.zigzag(ENC_PLAIN as i64);
             m.zigzag(ENC_RLE as i64);
+            if dictionary {
+                m.zigzag(ENC_RLE_DICTIONARY as i64);
+            }
             m.list(3, T_BINARY, 1);
             m.varint(col.name.len() as u64);
             m.buf.extend_from_slice(col.name.as_bytes());
@@ -222,6 +253,9 @@ pub fn write_file(path: &Path, rows: usize, cols: &[Col]) {
             m.i64(6, size as i64);
             m.i64(7, size as i64);
             m.i64(9, page as i64);
+            if dictionary {
+                m.i64(11, start as i64);
+            }
             m.end();
             m.end();
         }

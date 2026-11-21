@@ -1,8 +1,8 @@
 //! Memory mapping, a bump slab backed by huge pages, partition writers, threads.
 
-use std::arch::x86_64::{__m256i, _mm256_load_si256, _mm256_stream_si256, _mm_sfence};
 use std::fs::File;
 use std::marker::PhantomData;
+use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::null_mut;
@@ -18,6 +18,8 @@ const PAGE: usize = 4096;
 pub struct Buf {
     pub ptr: *const u8,
     pub len: usize,
+    /// Exactly the bytes on disk, including the terminating newline.
+    pub can_pread: bool,
 }
 unsafe impl Send for Buf {}
 unsafe impl Sync for Buf {}
@@ -35,6 +37,7 @@ fn heap_copy(src: &[u8]) -> Buf {
     Buf {
         ptr: v.leak().as_ptr(),
         len,
+        can_pread: false,
     }
 }
 
@@ -45,6 +48,7 @@ pub fn map_file(path: &Path) -> Buf {
         return Buf {
             ptr: EMPTY.as_ptr(),
             len: 0,
+            can_pread: false,
         };
     }
     unsafe {
@@ -76,17 +80,76 @@ pub fn map_file(path: &Path) -> Buf {
         }
         let ptr = p as *const u8;
         if *ptr.add(len - 1) != b'\n' {
+            // Extend the last line privately. Only its last page needs a
+            // copy, even when the file is several gigabytes long. For an
+            // exact page multiple, the newline lands on the reserved page.
+            let tail = ptr.add(len) as *mut u8;
+            let page = (tail as usize & !(PAGE - 1)) as *mut libc::c_void;
+            if libc::mprotect(page, PAGE, libc::PROT_READ | libc::PROT_WRITE) == 0 {
+                tail.write(b'\n');
+                return Buf {
+                    ptr,
+                    len: len + 1,
+                    can_pread: false,
+                };
+            }
             let b = heap_copy(std::slice::from_raw_parts(ptr, len));
             libc::munmap(base, span);
             return b;
         }
-        Buf { ptr, len }
+        Buf {
+            ptr,
+            len,
+            can_pread: true,
+        }
     }
 }
 
-/// Zero-filled anonymous memory, 2 MiB aligned, huge pages requested.
+/// One reusable read buffer and file handle per parser thread. A pread
+/// avoids installing and later tearing down a PTE for every event-file page.
+#[derive(Default)]
+pub struct EventReader {
+    file: Option<(usize, File)>,
+    bytes: Vec<u8>,
+}
+
+impl EventReader {
+    pub fn read(&mut self, path: &Path, buf: Buf, start: usize, len: usize) -> *const u8 {
+        let id = buf.ptr as usize;
+        if self.file.as_ref().map(|(key, _)| *key) != Some(id) {
+            let f = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+            self.file = Some((id, f));
+        }
+        if self.bytes.len() < len + SLACK {
+            self.bytes.resize(len + SLACK, 0);
+        }
+        self.file
+            .as_ref()
+            .unwrap()
+            .1
+            .read_exact_at(&mut self.bytes[..len], start as u64)
+            .unwrap_or_else(|e| panic!("read {} at {start}: {e}", path.display()));
+        self.bytes.as_ptr()
+    }
+}
+
+/// Page-aligned zero-filled memory. Large allocations request huge pages.
 pub fn anon(bytes: usize) -> *mut u8 {
     const HP: usize = 2 << 20;
+    if bytes < HP / 2 {
+        let p = unsafe {
+            libc::mmap(
+                null_mut(),
+                bytes.max(PAGE),
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(p, libc::MAP_FAILED, "cannot allocate {bytes} bytes");
+        return p.cast();
+    }
     let size = (bytes.max(1) + HP - 1) & !(HP - 1);
     unsafe {
         let p = libc::mmap(
@@ -223,122 +286,69 @@ pub struct Blk {
     pub n: u32,
 }
 
-#[derive(Clone, Copy)]
-struct Head {
-    /// Where the staged records will land.
-    dst: usize,
-    /// End of the current block.
+// 63 cache lines. Successive blocks start at different cache set indices;
+// both the 16-byte and 24-byte records divide the block exactly.
+const BLOCK_BYTES: usize = 63 * 64;
+
+#[derive(Clone, Copy, Default)]
+struct Cursor {
+    next: usize,
     end: usize,
-    /// Start of the current block; 0 before the first.
-    start: usize,
-    /// Bytes staged.
-    fill: usize,
 }
 
-const BLOCK_BYTES: usize = 6144;
-
-/// Appends records to one of `parts` partitions. Records are staged in a
-/// small per-partition buffer and moved to their block with non-temporal
-/// stores a few cache lines at a time, so the scatter touches few pages and
-/// never reads its destination. A record's final address is known when it is
-/// pushed and never changes.
+/// One cursor per partition keeps the next store and its block boundary
+/// together. Record addresses never change, so dedup can invalidate a
+/// payload in place even after its writer has moved on to another block.
 pub struct PartWriter<T> {
-    heads: Vec<Head>,
-    stage: *mut u8,
-    /// Staging bytes per partition: a multiple of both 64 and the record size.
-    wc: usize,
-    done: Vec<Vec<Blk>>,
-    _marker: PhantomData<T>,
+    cursors: Vec<Cursor>,
+    blocks: Vec<Vec<Blk>>,
+    _record: PhantomData<T>,
 }
 
 impl<T: Copy> PartWriter<T> {
     pub fn new(parts: usize) -> Self {
-        let size = std::mem::size_of::<T>();
-        let mut wc = 64;
-        while wc % size != 0 {
-            wc += 64;
-        }
-        assert!(BLOCK_BYTES % wc == 0);
+        assert_eq!(BLOCK_BYTES % std::mem::size_of::<T>(), 0);
         PartWriter {
-            heads: vec![
-                Head {
-                    dst: 0,
-                    end: 0,
-                    start: 0,
-                    fill: 0
-                };
-                parts
-            ],
-            stage: anon(parts * wc),
-            wc,
-            done: (0..parts).map(|_| Vec::new()).collect(),
-            _marker: PhantomData,
+            cursors: vec![Cursor::default(); parts],
+            blocks: (0..parts).map(|_| Vec::new()).collect(),
+            _record: PhantomData,
         }
     }
 
-    /// Returns the address the record will have once it is flushed.
     #[inline(always)]
     pub unsafe fn push(&mut self, part: usize, slab: &mut Slab, value: T) -> usize {
-        let wc = self.wc;
-        let mut h = *self.heads.get_unchecked(part);
-        if h.dst == h.end {
-            self.refill(part, slab);
-            h = *self.heads.get_unchecked(part);
+        let mut cursor = *self.cursors.get_unchecked(part);
+        if cursor.next == cursor.end {
+            cursor = self.new_block(part, slab);
         }
-        let stage = self.stage.add(part * wc);
-        (stage.add(h.fill) as *mut T).write_unaligned(value);
-        let addr = h.dst + h.fill;
-        h.fill += std::mem::size_of::<T>();
-        if h.fill == wc {
-            let mut i = 0;
-            while i < wc {
-                let v = _mm256_load_si256(stage.add(i) as *const __m256i);
-                _mm256_stream_si256((h.dst + i) as *mut __m256i, v);
-                i += 32;
-            }
-            h.dst += wc;
-            h.fill = 0;
-        }
-        *self.heads.get_unchecked_mut(part) = h;
-        addr
+        (cursor.next as *mut T).write(value);
+        let at = cursor.next;
+        cursor.next += std::mem::size_of::<T>();
+        *self.cursors.get_unchecked_mut(part) = cursor;
+        at
     }
 
     #[cold]
     #[inline(never)]
-    fn refill(&mut self, part: usize, slab: &mut Slab) {
-        self.close(part);
-        let b = slab.alloc(BLOCK_BYTES);
-        self.heads[part] = Head {
-            dst: b,
-            end: b + BLOCK_BYTES,
-            start: b,
-            fill: 0,
-        };
-    }
-
-    fn close(&mut self, part: usize) {
-        let h = self.heads[part];
-        if h.start == 0 {
-            return;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(self.stage.add(part * self.wc), h.dst as *mut u8, h.fill);
-        }
-        let n = (h.dst + h.fill - h.start) / std::mem::size_of::<T>();
-        if n > 0 {
-            self.done[part].push(Blk {
-                ptr: h.start,
-                n: n as u32,
-            });
+    fn new_block(&mut self, part: usize, slab: &mut Slab) -> Cursor {
+        let ptr = slab.alloc(BLOCK_BYTES);
+        self.blocks[part].push(Blk {
+            ptr,
+            n: (BLOCK_BYTES / std::mem::size_of::<T>()) as u32,
+        });
+        Cursor {
+            next: ptr,
+            end: ptr + BLOCK_BYTES,
         }
     }
 
     pub fn finish(mut self) -> Vec<Vec<Blk>> {
-        for part in 0..self.heads.len() {
-            self.close(part);
+        for (blocks, cursor) in self.blocks.iter_mut().zip(self.cursors) {
+            if let Some(last) = blocks.last_mut() {
+                last.n = ((cursor.next - last.ptr) / std::mem::size_of::<T>()) as u32;
+            }
         }
-        unsafe { _mm_sfence() };
-        self.done
+        self.blocks
     }
 }
 

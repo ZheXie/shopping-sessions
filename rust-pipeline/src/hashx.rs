@@ -2,8 +2,6 @@
 
 const S0: u64 = 0xa076_1d64_78bd_642f;
 const S1: u64 = 0xe703_7ed1_a0b4_28db;
-const S2: u64 = 0x8ebc_6af0_9c88_c6e3;
-const S3: u64 = 0x5899_65cc_7537_4cc3;
 
 #[inline(always)]
 fn mul(a: u64, b: u64) -> (u64, u64) {
@@ -59,17 +57,4 @@ pub unsafe fn hash(p: *const u8, len: usize) -> u64 {
     let (a, b, seed) = words(p, len);
     let (lo, hi) = mul(a ^ S1, b ^ seed);
     mum(lo ^ S0 ^ (len as u64), hi ^ S1)
-}
-
-/// The same hash plus a second, independent one.
-#[inline(always)]
-pub unsafe fn hash2(p: *const u8, len: usize) -> (u64, u64) {
-    let (a, b, seed) = words(p, len);
-    let (lo, hi) = mul(a ^ S1, b ^ seed);
-    let h = mum(lo ^ S0 ^ (len as u64), hi ^ S1);
-    let c = mum(
-        a ^ S2 ^ seed.rotate_left(23),
-        b ^ S3 ^ (len as u64).wrapping_mul(S1),
-    );
-    (h, c)
 }

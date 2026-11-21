@@ -6,51 +6,99 @@ Exact ETL for dirty click-stream logs → two daily Parquet tables. Fastest corr
 **Plan:** [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md)  
 **Track:** https://www.joinbuilders.org/buildathon/tracks/shopping-sessions
 
-## Status
+## Performance and validation
 
-Rust pipeline is the scored entry (`Dockerfile` → `/app/shopping-sessions`).
+The scored entry is the Rust binary built by the root Dockerfile. These local
+medians compare the optimized entry to upstream commit `ad075c9`.
 
-| Check | Result |
-| --- | --- |
-| 36 fixtures (binary and Docker image) | pass |
-| seed-1 1M `check-dev` | exact MATCH · ~55 ms |
-| 20M events + 5M clicks | ~0.9 s in-process, ~1.1–1.3 s `docker run` wall |
-| 60M events + 15M clicks | ~3.1 s in-process, 9.5 GB RSS (5.4 GB of it the mapped input) |
+| Generated input | Seed | Binary, original → optimized | Rootless OCI, original → optimized |
+| --- | ---: | ---: | ---: |
+| 20M events + 5M clicks | 714 | 0.562 → **0.359 s** | 0.657 → **0.441 s** |
+| 20M events + 5M clicks | 88231 | 0.542 → **0.382 s** | 0.676 → **0.441 s** |
+| 60M events + 15M clicks | 4213 | 2.040 → **1.259 s** | 2.097 → **1.549 s** |
 
-Timings are from a 4-core, 16 GB VM with a warm page cache; the scorer has 8 hyperthreads.
-5M, 20M and 30M outputs are identical to those of the first (slow, straightforward) Rust version.
+WSL2 on a Ryzen 7 7800X3D, eight visible CPUs, warm page cache, Linux
+filesystem for input and output, rustc 1.100.0. Each pair used the same input,
+alternating the order and creating fresh output directories. The 20M medians use
+seven process runs and five OCI runs per binary, after one warmup. The 60M
+medians use three runs after warmup. Process timing includes exit and memory
+reclamation. OCI timing spans `runc run` through exit with read-only input and
+rootfs, private networking, host runtime libraries and eight CPUs. The Docker
+daemon was unavailable on this host. Official hidden-set timing is pending.
 
-Python reference remains in `pipeline/pipeline.py` (correct but slow).
+- All 36 published fixtures pass with automatic SIMD dispatch and with AVX2 forced.
+- Both tables on the public seed-1 dev set match the published answer exactly.
+- Both 20M datasets and the 60M dataset match the original release output in
+  every column with zero duplicate keys. The 60M result contains 6,643,296
+  user rows and 28,014 campaign rows. Peak RSS fell from 9.17 to 3.77 GiB
+  in the local 60M correctness runs.
+- Targeted regressions check UTF-8 and embedded NUL IDs, tied clicks, malformed
+  and cross-chunk rows, missing final newlines, and duplicate ingest dates
+  outside the inline range. The earliest copy still wins across centuries.
+- The Python reference remains in `pipeline/pipeline.py`.
 
-## Quick start
+## Build and check
+
+The release target is Linux x86-64-v3. The container builds the scorer binary
+with profile-guided optimization (PGO). The build trains on the public generator
+with both automatic SIMD dispatch and the AVX2 fallback. Only the stripped
+binary goes into the runtime image.
 
 ```sh
-# Local binary
-make build-local
-make fixtures          # 36/36
-make dev               # needs `generate` on PATH (see third_party/generator)
-make run-dev && make check-dev
-
-# Scorer-shaped image
 make build
 make fixtures-docker
+
+# Fast local development build
+make build-local
+make fixtures
+(cd rust-pipeline && cargo test --release)
+
+# Match the scorer build locally
+rustup component add llvm-tools-preview
+make build-local-pgo
+python3 scripts/test_regressions.py rust-pipeline/target/release/shopping-sessions
+
+# Public dev answer, using the generator on PATH
+make dev
+NCPU=8 DATA_DIR=dev OUTPUT_DIR=out rust-pipeline/target/release/shopping-sessions
+make check-dev
 ```
 
-## Architecture (speed path)
+Use a fresh output directory for each invocation. The benchmark harness does so
+automatically, warms up each binary once, alternates the run order, and times
+the entire child process. To build a baseline and reproduce a practice run:
 
-1. `mmap` the inputs; AVX2 scan marks every `,` `\n` `"` (rules.md dialect, exact).
-2. Linked IDs: lock-free union-find in one open-addressing table keyed by a 64-bit ID hash;
-   afterwards each slot holds the person's key and name (smallest ID, inline up to 15 bytes).
-3. Parse in 2 MiB chunks on `NCPU` threads. Each event becomes a 16-byte dedup key (event-id
-   hash, ingest time) scattered by event-id hash and a 24-byte payload scattered by person.
-   Scatter uses write-combining buffers and non-temporal stores.
-4. Dedup per event-id partition; losers are flagged in their payload.
-5. Per person partition: group, sort, sessionize (30 min gap), credit and assists with a
-   sliding 7-day click window, emit `user_daily` rows; campaign totals are summed per thread.
-6. Own Parquet writer (PLAIN, uncompressed, `day` = DATE): one `user_daily` file per thread.
+```sh
+scratch=$(mktemp -d)
+git archive ad075c9 rust-pipeline | tar -x -C "$scratch"
+(cd "$scratch/rust-pipeline" && cargo build --release --locked)
+cargo build --release --locked --manifest-path third_party/generator/Cargo.toml
+third_party/generator/target/release/generate --seed 714 --events 20000000 --clicks 5000000 --output "$scratch/practice"
+python3 scripts/benchmark.py "$scratch/practice" "$scratch/rust-pipeline/target/release/shopping-sessions" rust-pipeline/target/release/shopping-sessions --runs 7
+```
 
-The only dependency is `libc`. Env: `DATA_DIR` / `OUTPUT_DIR` / `NCPU`.
-`SS_TIMING=1` prints stage timings.
+## Implementation
+
+- Parser threads read large event files into reusable buffers with `pread`.
+  A read-only mapping provides stable addresses for IDs needed after parsing.
+  SIMD builds an index of delimiters and wrapping quotes while checking the
+  contest dialect. AVX-512 byte compression is selected on capable CPUs.
+- Linked IDs use a compact concurrent union-find. Common short IDs have a
+  reversible one-word representation. Other IDs compare by their full bytes.
+- Parsing scatters 16-byte event keys and 16-byte payloads. Dedup keeps the
+  earliest ingest even when the winning event fails validation. Only purchases
+  look up a product category.
+- Larger person partitions start first. Small groups can use SIMD sorting
+  networks, and large groups use a time radix sort when their timestamp range
+  permits it. Sessionization and the seven-day attribution window run per person.
+- Each worker writes its own Parquet file. A dictionary stores each person ID
+  once per worker, and run-length encoding covers consecutive daily rows.
+  Campaign totals use a final reduction.
+
+The runtime takes `DATA_DIR`, `OUTPUT_DIR` and `NCPU`. Set `SS_TIMING=1` for
+stage diagnostics, `SS_AVX2=1` to exercise the AVX2 fallback, or `SS_READ=mmap`
+to compare the mapped event reader. The benchmark harness disables timing
+diagnostics to exclude memory-reporting overhead.
 
 ## Submit
 

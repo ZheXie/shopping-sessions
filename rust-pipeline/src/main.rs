@@ -97,7 +97,7 @@ struct EvStage {
     eh: u64,
     part: u64,
     ingest: i64,
-    uh: u64,
+    link_group: usize,
     name: Name,
     tp: u64,
     valid: bool,
@@ -105,7 +105,7 @@ struct EvStage {
 
 #[derive(Clone, Copy)]
 struct ClStage {
-    uh: u64,
+    link_group: usize,
     name: Name,
     click: Click,
 }
@@ -401,7 +401,7 @@ unsafe fn event_row(
     if valid {
         let up = base.add(f[1].0 as usize);
         s.name = links::name_at(up, user_len, source.add(f[1].0 as usize));
-        s.uh = name_hash(s.name);
+        s.link_group = ctx.links.prefetch(name_hash(s.name));
         let mut cat = 0;
         if price != 0 {
             let pp = base.add(f[5].0 as usize);
@@ -409,7 +409,6 @@ unsafe fn event_row(
             cat = if c == NONE { ctx.unknown } else { c as u64 };
         }
         s.tp = (rel << (PRICE_BITS + ctx.cat_bits)) | (price << ctx.cat_bits) | cat;
-        ctx.links.prefetch(s.uh);
     }
     w.nev += 1;
     if w.nev == BATCH {
@@ -423,7 +422,7 @@ unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
         let s = *w.ev.get_unchecked(i);
         let mut pay = 0u64;
         if s.valid {
-            let name = ctx.links.lookup(s.uh, s.name);
+            let name = ctx.links.lookup(s.link_group, s.name);
             let part = (name_hash(name).rotate_left(24) >> PART_SHIFT) as usize & ctx.person_mask;
             let at = w.pays.push(part, &mut w.slab, Pay { name, w: s.tp });
             pay = ((at - ctx.arena.base) / Arena::UNIT) as u64;
@@ -466,10 +465,9 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, source: *const u8,
     let up = base.add(f[1].0 as usize);
     let s = w.cl.get_unchecked_mut(w.ncl);
     s.name = links::name_at(up, user_len, source.add(f[1].0 as usize));
-    s.uh = name_hash(s.name);
+    s.link_group = ctx.links.prefetch(name_hash(s.name));
     s.click = Click::new(rel, camp, base.add(f[0].0 as usize),
                          (f[0].1 - f[0].0) as usize, source.add(f[0].0 as usize));
-    ctx.links.prefetch(s.uh);
     w.ncl += 1;
     if w.ncl == BATCH {
         flush_clicks(ctx, w);
@@ -480,7 +478,7 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, source: *const u8,
 unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
     for i in 0..w.ncl {
         let s = *w.cl.get_unchecked(i);
-        let name = ctx.links.lookup(s.uh, s.name);
+        let name = ctx.links.lookup(s.link_group, s.name);
         let part = (name_hash(name).rotate_left(24) >> PART_SHIFT) as usize & ctx.person_mask;
         w.clks.push(
             part,
@@ -1188,13 +1186,13 @@ fn main() {
             eh: 0,
             part: 0,
             ingest: 0,
-            uh: 0,
+            link_group: 0,
             name: 0,
             tp: 0,
             valid: false,
         };
         let blank_cl = ClStage {
-            uh: 0,
+            link_group: 0,
             name: 0,
             click: Click::default(),
         };

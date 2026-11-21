@@ -1,8 +1,7 @@
 //! Intern linked IDs and resolve every alias to the byte-wise smallest name.
 //! A compact name is also an exact lookup key and the event's grouping key.
 
-use std::arch::x86_64::{_mm_prefetch, _pext_u64, _MM_HINT_T0};
-use std::cell::UnsafeCell;
+use std::arch::x86_64::*;
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
@@ -136,63 +135,89 @@ unsafe fn compare_names(a: Name, b: Name) -> Ordering {
 
 pub type Edge = (Name, Name);
 
-#[repr(C)]
-struct Node {
-    key: AtomicU64,
-    // Exactly one worker writes each value after all unions complete.
-    person: UnsafeCell<Name>,
+// Group keys and canonical values in the same cache line. Every probe
+// starts at the beginning of a group and advances only after all four
+// slots are occupied. Lookup can compare four inline IDs together.
+#[repr(C, align(64))]
+struct Group {
+    keys: [AtomicU64; 4],
+    people: [AtomicU64; 4],
 }
 
 pub struct Table {
-    nodes: *mut Node,
+    groups: *mut Group,
     cap: usize,
 }
 unsafe impl Send for Table {}
 unsafe impl Sync for Table {}
 
+// The final lane's person also records whether an insertion continued into
+// the next group. Inline names have seven-bit suffix bytes; indirect names
+// store an input pointer (ADDR) shifted by eight, leaving bit 63 available.
+const OVERFLOW: u64 = 1 << 63;
 const GRAIN: usize = 4096;
 const AHEAD: usize = 8;
 
 impl Table {
     #[inline(always)]
-    fn slot(&self, h: u64) -> usize {
-        ((h as u128 * self.cap as u128) >> 64) as usize
+    fn first_slot(&self, hash: u64) -> usize {
+        ((hash as u128 * self.cap as u128 >> 64) as usize) & !3
     }
 
     #[inline(always)]
-    pub unsafe fn prefetch(&self, h: u64) {
+    pub unsafe fn prefetch(&self, h: u64) -> usize {
+        let group = self.first_slot(h) / 4;
         if self.cap != 0 {
-            _mm_prefetch(self.nodes.add(self.slot(h)) as *const i8, _MM_HINT_T0);
+            _mm_prefetch(self.groups.add(group).cast(), _MM_HINT_T0);
         }
+        group
     }
 
     #[inline(always)]
-    pub unsafe fn lookup(&self, h: u64, name: Name) -> Name {
-        if self.cap != 0 {
-            let mut i = self.slot(h);
-            loop {
-                let n = &*self.nodes.add(i);
-                let key = n.key.load(Relaxed);
-                if key == 0 {
-                    break;
+    pub unsafe fn lookup(&self, mut group: usize, name: Name) -> Name {
+        if self.cap == 0 {
+            return name;
+        }
+        loop {
+            let g = &*self.groups.add(group);
+            if name & INLINE != 0 {
+                let keys = _mm256_load_si256(g.keys.as_ptr().cast());
+                let equal = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(name as i64));
+                let mask = _mm256_movemask_pd(_mm256_castsi256_pd(equal));
+                // Lane zero is a readable placeholder when the mask is empty.
+                let lane = mask.trailing_zeros() as usize & 3;
+                if (mask != 0) | (g.people[3].load(Relaxed) & OVERFLOW == 0) {
+                    let found = g.people.get_unchecked(lane).load(Relaxed) & !OVERFLOW;
+                    return if mask != 0 { found } else { name };
                 }
-                if same_name(key, name) {
-                    return *n.person.get();
-                }
-                i += 1;
-                if i == self.cap {
-                    i = 0;
+            } else {
+                for lane in 0..4 {
+                    let key = g.keys[lane].load(Relaxed);
+                    if key == 0 {
+                        return name;
+                    }
+                    if same_name(key, name) {
+                        return g.people[lane].load(Relaxed) & !OVERFLOW;
+                    }
                 }
             }
+            group += 1;
+            if group == self.cap / 4 {
+                group = 0;
+            }
         }
-        name
+    }
+
+    #[inline(always)]
+    unsafe fn key(&self, slot: usize) -> &AtomicU64 {
+        (*self.groups.add(slot / 4)).keys.get_unchecked(slot % 4)
     }
 
     #[inline(always)]
     unsafe fn insert(&self, name: Name) -> u32 {
-        let mut i = self.slot(name_hash(name));
+        let mut i = self.first_slot(name_hash(name));
         loop {
-            let key = &(*self.nodes.add(i)).key;
+            let key = self.key(i);
             let mut seen = key.load(Relaxed);
             if seen == 0 {
                 match key.compare_exchange(0, name, Relaxed, Relaxed) {
@@ -202,6 +227,12 @@ impl Table {
             }
             if same_name(seen, name) {
                 return i as u32;
+            }
+            if i % 4 == 3 {
+                let flag = &(*self.groups.add(i / 4)).people[3];
+                if flag.load(Relaxed) == 0 {
+                    flag.store(OVERFLOW, Relaxed);
+                }
             }
             i += 1;
             if i == self.cap {
@@ -235,8 +266,8 @@ impl Table {
             if a == b {
                 return;
             }
-            let ka = (*self.nodes.add(a as usize)).key.load(Relaxed);
-            let kb = (*self.nodes.add(b as usize)).key.load(Relaxed);
+            let ka = self.key(a as usize).load(Relaxed);
+            let kb = self.key(b as usize).load(Relaxed);
             let (child, root) = if compare_names(ka, kb).is_lt() {
                 (b, a)
             } else {
@@ -256,21 +287,21 @@ impl Table {
         let total: usize = edge_lists.iter().map(Vec::len).sum();
         if total == 0 {
             return Table {
-                nodes: std::ptr::null_mut(),
+                groups: std::ptr::null_mut(),
                 cap: 0,
             };
         }
-        let cap = total * 9 / 4 + 16;
+        let cap = (total * 9 / 4 + 16).next_multiple_of(4);
         assert!(cap < u32::MAX as usize, "too many links");
-        let bytes = cap * std::mem::size_of::<Node>();
+        let bytes = cap / 4 * std::mem::size_of::<Group>();
         let table = Table {
-            nodes: anon(bytes) as *mut Node,
+            groups: anon(bytes) as *mut Group,
             cap,
         };
         let parents: Vec<AtomicU32> = (0..cap).map(|_| AtomicU32::new(0)).collect();
         let tasks: Vec<&[Edge]> = edge_lists.iter().flat_map(|v| v.chunks(GRAIN)).collect();
         let threads = threads.min(tasks.len()).max(1);
-        let base = table.nodes as usize;
+        let base = table.groups as usize;
         par_map(threads, |i| {
             const HP: usize = 2 << 20;
             let from = (bytes * i / threads) & !(HP - 1);
@@ -302,15 +333,43 @@ impl Table {
             }
         });
         par_map(threads, |i| unsafe {
-            let nodes = base as *mut Node;
             for s in cap * i / threads..cap * (i + 1) / threads {
-                let node = &*nodes.add(s);
-                if node.key.load(Relaxed) != 0 {
-                    let r = Self::find(&parents, s as u32);
-                    *node.person.get() = (*nodes.add(r as usize)).key.load(Relaxed);
+                if table.key(s).load(Relaxed) != 0 {
+                    let root = Self::find(&parents, s as u32);
+                    let group = &*table.groups.add(s / 4);
+                    let dest = &group.people[s % 4];
+                    let person = table.key(root as usize).load(Relaxed);
+                    dest.store(dest.load(Relaxed) | person, Relaxed);
                 }
             }
         });
         table
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linked_names_can_probe_across_the_end_of_the_table() {
+        let edge_count = 11;
+        let cap = (edge_count * 9usize / 4 + 16).next_multiple_of(4);
+        let names: Vec<_> = (0..)
+            .map(|i| {
+                let id = format!("u{i:08}");
+                unsafe { name_of(id.as_ptr(), id.len()) }
+            })
+            .filter(|&name| (name_hash(name) as u128 * cap as u128 >> 64) as usize >= cap - 4)
+            .take(edge_count + 2)
+            .collect();
+        let edges = names[1..=edge_count].iter().map(|&name| (names[0], name)).collect();
+        let table = Table::build(&[edges], 1);
+        let resolve = |name| unsafe { table.lookup(table.prefetch(name_hash(name)), name) };
+        for &name in &names[..=edge_count] {
+            assert_eq!(resolve(name), names[0]);
+        }
+        let absent = names[edge_count + 1];
+        assert_eq!(resolve(absent), absent);
     }
 }

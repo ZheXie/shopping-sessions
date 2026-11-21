@@ -37,7 +37,8 @@ unsafe fn words(p: *const u8, len: usize) -> (u64, u64, u64) {
         } else if len >= 4 {
             (r4(p) as u64, r4(p.add(len - 4)) as u64, S0)
         } else if len > 0 {
-            let a = ((*p as u64) << 16) | ((*p.add(len >> 1) as u64) << 8) | (*p.add(len - 1) as u64);
+            let a =
+                ((*p as u64) << 16) | ((*p.add(len >> 1) as u64) << 8) | (*p.add(len - 1) as u64);
             (a, 0, S0)
         } else {
             (0, 0, S0)
@@ -66,6 +67,9 @@ pub unsafe fn hash2(p: *const u8, len: usize) -> (u64, u64) {
     let (a, b, seed) = words(p, len);
     let (lo, hi) = mul(a ^ S1, b ^ seed);
     let h = mum(lo ^ S0 ^ (len as u64), hi ^ S1);
-    let c = mum(a ^ S2 ^ seed.rotate_left(23), b ^ S3 ^ (len as u64).wrapping_mul(S1));
+    let c = mum(
+        a ^ S2 ^ seed.rotate_left(23),
+        b ^ S3 ^ (len as u64).wrapping_mul(S1),
+    );
     (h, c)
 }

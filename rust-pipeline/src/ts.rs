@@ -22,9 +22,34 @@ unsafe fn civil19(p: *const u8) -> i64 {
     let (m0, m1, d0, d1) = (d(5), d(6), d(8), d(9));
     let (h0, h1, i0, i1, s0, s1) = (d(11), d(12), d(14), d(15), d(17), d(18));
     // x <= 9 exactly when neither x nor x + 6 has a bit above the low nibble.
-    let digits = y0 | y1 | y2 | y3 | m0 | m1 | d0 | d1 | h0 | h1 | i0 | i1 | s0 | s1
-        | (y0 + 6) | (y1 + 6) | (y2 + 6) | (y3 + 6) | (m0 + 6) | (m1 + 6) | (d0 + 6) | (d1 + 6)
-        | (h0 + 6) | (h1 + 6) | (i0 + 6) | (i1 + 6) | (s0 + 6) | (s1 + 6);
+    let digits = y0
+        | y1
+        | y2
+        | y3
+        | m0
+        | m1
+        | d0
+        | d1
+        | h0
+        | h1
+        | i0
+        | i1
+        | s0
+        | s1
+        | (y0 + 6)
+        | (y1 + 6)
+        | (y2 + 6)
+        | (y3 + 6)
+        | (m0 + 6)
+        | (m1 + 6)
+        | (d0 + 6)
+        | (d1 + 6)
+        | (h0 + 6)
+        | (h1 + 6)
+        | (i0 + 6)
+        | (i1 + 6)
+        | (s0 + 6)
+        | (s1 + 6);
     let seps = (*p.add(4) ^ b'-')
         | (*p.add(7) ^ b'-')
         | (*p.add(10) ^ b'T')
@@ -102,7 +127,11 @@ pub unsafe fn parse(p: *const u8, len: usize) -> i64 {
                 return BAD;
             }
             let offset = ((oh * 3600 + om * 60) as i64) * 1000;
-            return if sign == b'+' { local - offset } else { local + offset };
+            return if sign == b'+' {
+                local - offset
+            } else {
+                local + offset
+            };
         }
     }
     digits(p, len)

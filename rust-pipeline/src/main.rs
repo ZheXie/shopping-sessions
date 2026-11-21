@@ -89,7 +89,10 @@ struct SmallTab {
 impl SmallTab {
     fn new(n: usize) -> Self {
         let cap = (n * 2 + 2).next_power_of_two().max(16);
-        SmallTab { slots: vec![0; cap], mask: cap - 1 }
+        SmallTab {
+            slots: vec![0; cap],
+            mask: cap - 1,
+        }
     }
 
     fn insert(&mut self, h: u64, val: u32) {
@@ -125,7 +128,10 @@ impl SmallTab {
 
     #[inline(always)]
     unsafe fn prefetch(&self, h: u64) {
-        _mm_prefetch(self.slots.as_ptr().add(h as usize & self.mask) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(
+            self.slots.as_ptr().add(h as usize & self.mask) as *const i8,
+            _MM_HINT_T0,
+        );
     }
 }
 
@@ -196,7 +202,11 @@ fn list_csvs(dir: &Path) -> Vec<Buf> {
         .filter(|p| p.extension().map(|x| x == "csv").unwrap_or(false))
         .collect();
     paths.sort();
-    paths.iter().map(|p| sys::map_file(p)).filter(|b| b.len > 0).collect()
+    paths
+        .iter()
+        .map(|p| sys::map_file(p))
+        .filter(|b| b.len > 0)
+        .collect()
 }
 
 fn load_manifest(data: &Path) -> (i64, i64) {
@@ -307,7 +317,11 @@ fn load_dims(data: &Path) -> (SmallTab, SmallTab, u64, Dims) {
                 return;
             }
             let cat = field(base, f[1]);
-            let c = if cat.is_empty() { unknown_tmp } else { intern(cat, &mut cat_ids) };
+            let c = if cat.is_empty() {
+                unknown_tmp
+            } else {
+                intern(cat, &mut cat_ids)
+            };
             raw_products.push((hash(id.as_ptr(), id.len()), c));
         });
     }
@@ -318,7 +332,10 @@ fn load_dims(data: &Path) -> (SmallTab, SmallTab, u64, Dims) {
     for (r, &i) in order.iter().enumerate() {
         rank[i as usize] = r as u32;
     }
-    let cat_names: Vec<Vec<u8>> = order.iter().map(|&i| cat_list[i as usize].clone()).collect();
+    let cat_names: Vec<Vec<u8>> = order
+        .iter()
+        .map(|&i| cat_list[i as usize].clone())
+        .collect();
     let mut products = SmallTab::new(raw_products.len());
     for &(h, c) in &raw_products {
         products.insert(h, rank[c as usize]);
@@ -345,7 +362,16 @@ fn load_dims(data: &Path) -> (SmallTab, SmallTab, u64, Dims) {
         campaigns.insert(h, i as u32);
     }
     let unknown = rank[unknown_tmp as usize] as u64;
-    (products, campaigns, unknown, Dims { cat_names, camp_names, channels })
+    (
+        products,
+        campaigns,
+        unknown,
+        Dims {
+            cat_names,
+            camp_names,
+            channels,
+        },
+    )
 }
 
 fn load_links(files: &[Buf], threads: usize) -> Table {
@@ -453,11 +479,26 @@ unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
             let c = ctx.products.get(s.ph);
             let cat = if c == NONE { ctx.unknown } else { c as u64 };
             let part = (pk >> PART_SHIFT) as usize & ctx.person_mask;
-            let at = w.pays.push(part, &mut w.slab, Pay { n0: name.0, n1: name.1, w: s.tp | cat });
+            let at = w.pays.push(
+                part,
+                &mut w.slab,
+                Pay {
+                    n0: name.0,
+                    n1: name.1,
+                    w: s.tp | cat,
+                },
+            );
             pay = ((at - ctx.arena.base) / Arena::UNIT) as u64;
         }
         let part = (s.part >> PART_SHIFT) as usize & ctx.ev_mask;
-        w.keys.push(part, &mut w.slab, Key { h: s.eh, x: (pay << INGEST_BITS) | s.ingest });
+        w.keys.push(
+            part,
+            &mut w.slab,
+            Key {
+                h: s.eh,
+                x: (pay << INGEST_BITS) | s.ingest,
+            },
+        );
     }
     w.nev = 0;
 }
@@ -498,7 +539,16 @@ unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
         let s = *w.cl.get_unchecked(i);
         let (pk, name) = ctx.links.lookup(s.uh, s.up as *const u8, s.ulen as usize);
         let part = (pk >> PART_SHIFT) as usize & ctx.person_mask;
-        w.clks.push(part, &mut w.slab, Clk { n0: name.0, n1: name.1, cp: s.cp, t: s.t });
+        w.clks.push(
+            part,
+            &mut w.slab,
+            Clk {
+                n0: name.0,
+                n1: name.1,
+                cp: s.cp,
+                t: s.t,
+            },
+        );
     }
     w.ncl = 0;
 }
@@ -726,7 +776,9 @@ impl<'a> Agg<'a> {
             self.evs.resize(nev, 0);
         }
         for i in 0..nev {
-            let at = self.ev_end.get_unchecked_mut(*self.ev_idx.get_unchecked(i) as usize);
+            let at = self
+                .ev_end
+                .get_unchecked_mut(*self.ev_idx.get_unchecked(i) as usize);
             *self.evs.get_unchecked_mut(*at as usize) = *self.ev_w.get_unchecked(i);
             *at += 1;
         }
@@ -735,7 +787,9 @@ impl<'a> Agg<'a> {
             self.cks.resize(nck, (0, 0));
         }
         for i in 0..nck {
-            let at = self.ck_end.get_unchecked_mut(*self.ck_idx.get_unchecked(i) as usize);
+            let at = self
+                .ck_end
+                .get_unchecked_mut(*self.ck_idx.get_unchecked(i) as usize);
             *self.cks.get_unchecked_mut(*at as usize) = *self.ck_raw.get_unchecked(i);
             *at += 1;
         }
@@ -761,7 +815,9 @@ impl<'a> Agg<'a> {
             let (day, begin) = *self.days.get_unchecked(i);
             let start = from.max(begin);
             if end > start {
-                self.out.camp.get_unchecked_mut(camp * self.ndays + day as usize)[3] += (end - start) as i64;
+                self.out
+                    .camp
+                    .get_unchecked_mut(camp * self.ndays + day as usize)[3] += (end - start) as i64;
             }
             if begin <= from {
                 break;
@@ -784,7 +840,8 @@ impl<'a> Agg<'a> {
             o.names.set_len(o.names.len() + 4 + len);
         } else {
             let bytes = id_bytes(name.1 & ADDR);
-            o.names.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            o.names
+                .extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             o.names.extend_from_slice(bytes);
         }
         o.day.push(self.day0 + day as i32);
@@ -812,7 +869,14 @@ impl<'a> Agg<'a> {
         o.rows += 1;
     }
 
-    unsafe fn person(&mut self, name: Name, ev_at: usize, ev_to: usize, ck_at: usize, ck_to: usize) {
+    unsafe fn person(
+        &mut self,
+        name: Name,
+        ev_at: usize,
+        ev_to: usize,
+        ck_at: usize,
+        ck_to: usize,
+    ) {
         let cat_bits = self.ctx.cat_bits;
         let shift = PRICE_BITS + cat_bits;
         let cat_mask = (1u64 << cat_bits) - 1;
@@ -901,7 +965,10 @@ impl<'a> Agg<'a> {
             } else {
                 self.organic
             };
-            let acc = self.out.camp.get_unchecked_mut(camp * self.ndays + day as usize);
+            let acc = self
+                .out
+                .camp
+                .get_unchecked_mut(camp * self.ndays + day as usize);
             acc[0] += 1;
             acc[1] += (revenue != 0) as i64;
             acc[2] += revenue as i64;
@@ -924,17 +991,47 @@ impl<'a> Agg<'a> {
 
 fn write_user_file(dir: &Path, index: usize, o: &Out) {
     let cols = [
-        Col { name: "user_id", kind: Kind::Str, parts: vec![&o.names] },
-        Col { name: "day", kind: Kind::Date, parts: vec![bytes_of(&o.day)] },
-        Col { name: "sessions", kind: Kind::I32, parts: vec![bytes_of(&o.sessions)] },
-        Col { name: "events", kind: Kind::I32, parts: vec![bytes_of(&o.events)] },
-        Col { name: "revenue_cents", kind: Kind::I64, parts: vec![bytes_of(&o.revenue)] },
-        Col { name: "top_category", kind: Kind::OptStr, parts: vec![&o.top_def, &o.top] },
+        Col {
+            name: "user_id",
+            kind: Kind::Str,
+            parts: vec![&o.names],
+        },
+        Col {
+            name: "day",
+            kind: Kind::Date,
+            parts: vec![bytes_of(&o.day)],
+        },
+        Col {
+            name: "sessions",
+            kind: Kind::I32,
+            parts: vec![bytes_of(&o.sessions)],
+        },
+        Col {
+            name: "events",
+            kind: Kind::I32,
+            parts: vec![bytes_of(&o.events)],
+        },
+        Col {
+            name: "revenue_cents",
+            kind: Kind::I64,
+            parts: vec![bytes_of(&o.revenue)],
+        },
+        Col {
+            name: "top_category",
+            kind: Kind::OptStr,
+            parts: vec![&o.top_def, &o.top],
+        },
     ];
     pq::write_file(&dir.join(format!("part-{index}.parquet")), o.rows, &cols);
 }
 
-fn write_campaign_file(dir: &Path, dims: &Dims, ndays: usize, day0: i32, acc: &[[i64; 4]]) -> usize {
+fn write_campaign_file(
+    dir: &Path,
+    dims: &Dims,
+    ndays: usize,
+    day0: i32,
+    acc: &[[i64; 4]],
+) -> usize {
     let (mut ids, mut channels) = (Vec::new(), Vec::new());
     let mut day: Vec<i32> = Vec::new();
     let mut cols: [Vec<i64>; 4] = Default::default();
@@ -962,13 +1059,41 @@ fn write_campaign_file(dir: &Path, dims: &Dims, ndays: usize, day0: i32, acc: &[
     }
     let rows = day.len();
     let table = [
-        Col { name: "campaign_id", kind: Kind::Str, parts: vec![&ids] },
-        Col { name: "channel", kind: Kind::Str, parts: vec![&channels] },
-        Col { name: "day", kind: Kind::Date, parts: vec![bytes_of(&day)] },
-        Col { name: "sessions", kind: Kind::I64, parts: vec![bytes_of(&cols[0])] },
-        Col { name: "purchasing_sessions", kind: Kind::I64, parts: vec![bytes_of(&cols[1])] },
-        Col { name: "revenue_cents", kind: Kind::I64, parts: vec![bytes_of(&cols[2])] },
-        Col { name: "assisted_sessions", kind: Kind::I64, parts: vec![bytes_of(&cols[3])] },
+        Col {
+            name: "campaign_id",
+            kind: Kind::Str,
+            parts: vec![&ids],
+        },
+        Col {
+            name: "channel",
+            kind: Kind::Str,
+            parts: vec![&channels],
+        },
+        Col {
+            name: "day",
+            kind: Kind::Date,
+            parts: vec![bytes_of(&day)],
+        },
+        Col {
+            name: "sessions",
+            kind: Kind::I64,
+            parts: vec![bytes_of(&cols[0])],
+        },
+        Col {
+            name: "purchasing_sessions",
+            kind: Kind::I64,
+            parts: vec![bytes_of(&cols[1])],
+        },
+        Col {
+            name: "revenue_cents",
+            kind: Kind::I64,
+            parts: vec![bytes_of(&cols[2])],
+        },
+        Col {
+            name: "assisted_sessions",
+            kind: Kind::I64,
+            parts: vec![bytes_of(&cols[3])],
+        },
     ];
     pq::write_file(&dir.join("part-0.parquet"), rows, &table);
     rows
@@ -998,7 +1123,11 @@ fn main() {
 
     let threads = env_usize("NCPU")
         .filter(|&n| n > 0)
-        .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4))
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+        })
         .min(256);
     let data = env_path("DATA_DIR", "/data");
     let out_dir = env_path("OUTPUT_DIR", "/output");
@@ -1061,9 +1190,24 @@ fn main() {
     let next = AtomicUsize::new(0);
     let scattered = par_map(threads, |_| {
         let mut sc = Scan::new();
-        let blank_ev =
-            EvStage { eh: 0, part: 0, ingest: 0, uh: 0, up: 0, ulen: 0, ph: 0, tp: 0, valid: false };
-        let blank_cl = ClStage { uh: 0, up: 0, ulen: 0, cp: 0, t: 0 };
+        let blank_ev = EvStage {
+            eh: 0,
+            part: 0,
+            ingest: 0,
+            uh: 0,
+            up: 0,
+            ulen: 0,
+            ph: 0,
+            tp: 0,
+            valid: false,
+        };
+        let blank_cl = ClStage {
+            uh: 0,
+            up: 0,
+            ulen: 0,
+            cp: 0,
+            t: 0,
+        };
         let mut w = Work {
             slab: Slab::new(&ctx.arena),
             keys: PartWriter::new(ev_parts),
@@ -1084,26 +1228,48 @@ fn main() {
             unsafe {
                 if mode == 1 {
                     let mut pos = scan::line_start(buf.ptr, buf.len, a);
-                    while pos < b { pos = sc.scan(buf.ptr, buf.len, pos, (pos + sub).min(b)); }
+                    while pos < b {
+                        pos = sc.scan(buf.ptr, buf.len, pos, (pos + sub).min(b));
+                    }
                     continue;
                 }
                 if mode == 2 {
                     let mut x = 0u64;
-                    if is_events { for_rows::<7, _>(&mut sc, buf, a, b, sub, |_, f| x += f[0].0 as u64); }
-                    else { for_rows::<4, _>(&mut sc, buf, a, b, sub, |_, f| x += f[0].0 as u64); }
+                    if is_events {
+                        for_rows::<7, _>(&mut sc, buf, a, b, sub, |_, f| x += f[0].0 as u64);
+                    } else {
+                        for_rows::<4, _>(&mut sc, buf, a, b, sub, |_, f| x += f[0].0 as u64);
+                    }
                     std::hint::black_box(x);
                     continue;
                 }
                 if mode == 3 {
-                    if is_events { for_rows::<7, _>(&mut sc, buf, a, b, sub, |base, f| { event_row(&ctx, &mut w, base, f); if w.nev == BATCH - 1 { w.nev = 0; } }); }
-                    else { for_rows::<4, _>(&mut sc, buf, a, b, sub, |base, f| { click_row(&ctx, &mut w, base, f); if w.ncl == BATCH - 1 { w.ncl = 0; } }); }
+                    if is_events {
+                        for_rows::<7, _>(&mut sc, buf, a, b, sub, |base, f| {
+                            event_row(&ctx, &mut w, base, f);
+                            if w.nev == BATCH - 1 {
+                                w.nev = 0;
+                            }
+                        });
+                    } else {
+                        for_rows::<4, _>(&mut sc, buf, a, b, sub, |base, f| {
+                            click_row(&ctx, &mut w, base, f);
+                            if w.ncl == BATCH - 1 {
+                                w.ncl = 0;
+                            }
+                        });
+                    }
                     continue;
                 }
                 if is_events {
-                    for_rows::<7, _>(&mut sc, buf, a, b, sub, |base, f| event_row(&ctx, &mut w, base, f));
+                    for_rows::<7, _>(&mut sc, buf, a, b, sub, |base, f| {
+                        event_row(&ctx, &mut w, base, f)
+                    });
                     flush_events(&ctx, &mut w);
                 } else {
-                    for_rows::<4, _>(&mut sc, buf, a, b, sub, |base, f| click_row(&ctx, &mut w, base, f));
+                    for_rows::<4, _>(&mut sc, buf, a, b, sub, |base, f| {
+                        click_row(&ctx, &mut w, base, f)
+                    });
                     flush_clicks(&ctx, &mut w);
                 }
             }
@@ -1150,7 +1316,10 @@ fn main() {
             write_user_file(&user_dir, t, &agg.out);
         }
         if timing {
-            eprintln!("  thread {t}: partitions done at {t_parts:.1} ms, file at {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "  thread {t}: partitions done at {t_parts:.1} ms, file at {:.1} ms",
+                started.elapsed().as_secs_f64() * 1e3
+            );
         }
         (agg.out.rows, std::mem::take(&mut agg.out.camp))
     });
@@ -1171,23 +1340,45 @@ fn main() {
     let camp_rows = write_campaign_file(&camp_dir, &dims, ndays, day0 as i32, &total);
     lap("campaigns");
     if timing {
-        eprintln!("{:>10} {:>8.1} ms", "total", started.elapsed().as_secs_f64() * 1e3);
+        eprintln!(
+            "{:>10} {:>8.1} ms",
+            "total",
+            started.elapsed().as_secs_f64() * 1e3
+        );
         if std::env::var("SS_SMAPS").is_ok() {
             if let Ok(maps) = fs::read_to_string("/proc/self/smaps") {
                 let mut head = String::new();
                 let (mut size, mut rss) = (0u64, 0u64);
                 for line in maps.lines() {
-                    let num = || line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-                    if line.starts_with("Size:") { size = num(); }
-                    else if line.starts_with("Rss:") { rss = num(); }
-                    else if line.starts_with("AnonHugePages:") {
-                        if rss > 16000 && !head.contains(".csv") { eprintln!("  {head} size={size}k rss={rss}k thp={}k", num()); }
-                    } else if line.split_whitespace().nth(1).map(|t| t.len() == 4 && t.ends_with('p')).unwrap_or(false) { head = line.to_string(); }
+                    let num = || {
+                        line.split_whitespace()
+                            .nth(1)
+                            .and_then(|v| v.parse::<u64>().ok())
+                            .unwrap_or(0)
+                    };
+                    if line.starts_with("Size:") {
+                        size = num();
+                    } else if line.starts_with("Rss:") {
+                        rss = num();
+                    } else if line.starts_with("AnonHugePages:") {
+                        if rss > 16000 && !head.contains(".csv") {
+                            eprintln!("  {head} size={size}k rss={rss}k thp={}k", num());
+                        }
+                    } else if line
+                        .split_whitespace()
+                        .nth(1)
+                        .map(|t| t.len() == 4 && t.ends_with('p'))
+                        .unwrap_or(false)
+                    {
+                        head = line.to_string();
+                    }
                 }
             }
         }
         if let Ok(roll) = fs::read_to_string("/proc/self/smaps_rollup") {
-            for line in roll.lines().filter(|l| l.starts_with("Rss") || l.starts_with("AnonHuge") || l.starts_with("Anonymous")) {
+            for line in roll.lines().filter(|l| {
+                l.starts_with("Rss") || l.starts_with("AnonHuge") || l.starts_with("Anonymous")
+            }) {
                 eprintln!("  {line}");
             }
         }

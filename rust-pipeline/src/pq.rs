@@ -41,7 +41,11 @@ struct Thrift {
 
 impl Thrift {
     fn new() -> Self {
-        Thrift { buf: Vec::with_capacity(1024), last: 0, stack: Vec::new() }
+        Thrift {
+            buf: Vec::with_capacity(1024),
+            last: 0,
+            stack: Vec::new(),
+        }
     }
     fn varint(&mut self, mut v: u64) {
         while v >= 0x80 {

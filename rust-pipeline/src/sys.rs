@@ -32,17 +32,27 @@ fn heap_copy(src: &[u8]) -> Buf {
     }
     let len = v.len();
     v.resize(len + SLACK, 0);
-    Buf { ptr: v.leak().as_ptr(), len }
+    Buf {
+        ptr: v.leak().as_ptr(),
+        len,
+    }
 }
 
 pub fn map_file(path: &Path) -> Buf {
     let f = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
     if len == 0 {
-        return Buf { ptr: EMPTY.as_ptr(), len: 0 };
+        return Buf {
+            ptr: EMPTY.as_ptr(),
+            len: 0,
+        };
     }
     unsafe {
-        let pop = if std::env::var("SS_POP").is_ok() { libc::MAP_POPULATE } else { 0 };
+        let pop = if std::env::var("SS_POP").is_ok() {
+            libc::MAP_POPULATE
+        } else {
+            0
+        };
         // Reserve one zero page past the file so the slack is always readable.
         let span = ((len + PAGE - 1) & !(PAGE - 1)) + PAGE;
         let base = libc::mmap(
@@ -56,7 +66,14 @@ pub fn map_file(path: &Path) -> Buf {
         let p = if base == libc::MAP_FAILED {
             libc::MAP_FAILED
         } else {
-            libc::mmap(base, len, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_FIXED | pop, f.as_raw_fd(), 0)
+            libc::mmap(
+                base,
+                len,
+                libc::PROT_READ,
+                libc::MAP_PRIVATE | libc::MAP_FIXED | pop,
+                f.as_raw_fd(),
+                0,
+            )
         };
         if p == libc::MAP_FAILED {
             let v = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -124,7 +141,11 @@ impl Arena {
             if p != libc::MAP_FAILED {
                 let base = (p as usize + HP - 1) & !(HP - 1);
                 unsafe { libc::madvise(base as *mut libc::c_void, size, libc::MADV_HUGEPAGE) };
-                return Arena { base, size: size - HP, next: AtomicUsize::new(HP) };
+                return Arena {
+                    base,
+                    size: size - HP,
+                    next: AtomicUsize::new(HP),
+                };
             }
             size /= 2;
             assert!(size >= 64 << 20, "cannot reserve address space");
@@ -147,7 +168,11 @@ pub struct Slab<'a> {
 
 impl<'a> Slab<'a> {
     pub fn new(arena: &'a Arena) -> Self {
-        Slab { arena, cur: 0, end: 0 }
+        Slab {
+            arena,
+            cur: 0,
+            end: 0,
+        }
     }
 
     #[inline(always)]
@@ -240,7 +265,15 @@ impl<T: Copy> PartWriter<T> {
         }
         assert!(BLOCK_BYTES % wc == 0);
         PartWriter {
-            heads: vec![Head { dst: 0, end: 0, start: 0, fill: 0 }; parts],
+            heads: vec![
+                Head {
+                    dst: 0,
+                    end: 0,
+                    start: 0,
+                    fill: 0
+                };
+                parts
+            ],
             stage: anon(parts * wc),
             wc,
             done: (0..parts).map(|_| Vec::new()).collect(),
@@ -280,7 +313,12 @@ impl<T: Copy> PartWriter<T> {
     fn refill(&mut self, part: usize, slab: &mut Slab) {
         self.close(part);
         let b = slab.alloc(BLOCK_BYTES);
-        self.heads[part] = Head { dst: b, end: b + BLOCK_BYTES, start: b, fill: 0 };
+        self.heads[part] = Head {
+            dst: b,
+            end: b + BLOCK_BYTES,
+            start: b,
+            fill: 0,
+        };
     }
 
     fn close(&mut self, part: usize) {
@@ -293,7 +331,10 @@ impl<T: Copy> PartWriter<T> {
         }
         let n = (h.dst + h.fill - h.start) / std::mem::size_of::<T>();
         if n > 0 {
-            self.done[part].push(Blk { ptr: h.start, n: n as u32 });
+            self.done[part].push(Blk {
+                ptr: h.start,
+                n: n as u32,
+            });
         }
     }
 

@@ -24,14 +24,24 @@ const AHEAD: usize = 1024;
 
 impl Scan {
     pub fn new() -> Self {
-        Scan { seps: Vec::with_capacity(1 << 16), inner: Vec::with_capacity(64), total: 0 }
+        Scan {
+            seps: Vec::with_capacity(1 << 16),
+            inner: Vec::with_capacity(64),
+            total: 0,
+        }
     }
 
     /// Indexes whole lines from `start` (a line start) until at least
     /// `soft_end` is passed and one line is complete. Returns the offset of
     /// the first line not indexed. Needs `SLACK` readable bytes after `len`.
     #[inline(never)]
-    pub unsafe fn scan(&mut self, buf: *const u8, len: usize, start: usize, soft_end: usize) -> usize {
+    pub unsafe fn scan(
+        &mut self,
+        buf: *const u8,
+        len: usize,
+        start: usize,
+        soft_end: usize,
+    ) -> usize {
         self.inner.clear();
         let vc = _mm256_set1_epi8(b',' as i8);
         let vn = _mm256_set1_epi8(b'\n' as i8);

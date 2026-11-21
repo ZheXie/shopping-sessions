@@ -64,77 +64,77 @@ impl Scan {
         self.tags.clear();
         self.errors.clear();
         let mut nsep = 0usize;
-        let mut total = 0usize;
-        let mut prev_sep = 1u64;
+        let end = if soft_end < len {
+            line_start(buf, len, soft_end.max(start + 1))
+        } else {
+            len
+        };
+        // Bit one is the virtual separator just before the first byte.
+        let mut prev_seps = 2u64;
         let mut prev_quote = 0u64;
-        let mut next_field_quoted = (*buf.add(start) == b'"') as u64;
+        let mut open_carry = 0u64;
         let mut pos = start;
-        while pos < len {
-            // A block contributes at most 64 separators. SIMD stores can use
-            // unused lanes beyond the last separator.
-            if nsep + 72 > self.seps.capacity().min(self.tags.capacity()) {
-                self.seps.set_len(nsep);
-                self.tags.set_len(nsep);
-                self.seps.reserve(nsep.max(4096));
-                self.tags.reserve(nsep.max(4096));
-            }
-            _mm_prefetch(buf.add((pos + LOOKAHEAD).min(len)).cast(), _MM_HINT_T0);
-            let (mut commas, mut newlines, mut quotes) = classify::<WIDE>(buf.add(pos));
-            let remaining = len - pos;
-            if remaining < 64 {
-                let keep = (1u64 << remaining) - 1;
-                commas &= keep;
-                newlines &= keep;
-                quotes &= keep;
-            }
-            let separators = commas | newlines;
-            let count = separators.count_ones() as usize;
-            let offset = (pos - start) as u32;
-            let after = *buf.add(pos + 64);
-            let after_sep = matches!(after, b',' | b'\n') as u64;
-            let left = (separators << 1) | prev_sep;
-            let right = (separators >> 1) | (after_sep << 63);
-            // An interior quote has neither neighbour as a separator. A quote
-            // with both neighbours as separators is an invalid one-byte field.
-            let mut bad = quotes & !(left ^ right);
-            prev_sep = separators >> 63;
-
-            // In separator order, each closing flag must equal the previous
-            // separator's opening flag, including across a block boundary.
-            let closes = _pext_u64((quotes << 1) | prev_quote, separators);
-            let opens = _pext_u64((quotes >> 1) | (((after == b'"') as u64) << 63), separators);
-            let mismatch = closes ^ _bzhi_u64((opens << 1) | next_field_quoted, count as u32);
-            if count != 0 {
-                next_field_quoted = opens >> (count - 1);
-            }
-            prev_quote = quotes >> 63;
-            if mismatch != 0 {
-                bad |= _pdep_u64(mismatch, separators);
-            }
-            while bad != 0 {
-                self.errors.push(offset + bad.trailing_zeros());
-                bad &= bad - 1;
-            }
-            let ends = _pext_u64(newlines, separators);
-            if ends != 0 {
-                total = nsep + (64 - ends.leading_zeros()) as usize;
-            }
-            let dst = self.tags.as_mut_ptr().add(nsep);
-            let mut i = 0;
-            loop {
-                let tags = _pdep_u64(closes >> i, BYTE_LSB) | _pdep_u64(ends >> i, BYTE_LSB << 1);
-                dst.add(i).cast::<u64>().write_unaligned(tags);
-                i += 8;
-                if i >= count {
-                    break;
+        while pos < end {
+            let batch_end = (pos + 8192).min(end);
+            // Any byte may be a separator. Reserve for a batch of vector
+            // loads, including unused lanes of the final unmasked stores.
+            let additional = batch_end - pos + 72;
+            self.seps.set_len(nsep);
+            self.tags.set_len(nsep);
+            self.seps.reserve(additional);
+            self.tags.reserve(additional);
+            while pos < batch_end {
+                _mm_prefetch(buf.add((pos + LOOKAHEAD).min(len)).cast(), _MM_HINT_T0);
+                let (mut commas, mut newlines, mut quotes) = classify::<WIDE>(buf.add(pos));
+                let remaining = end - pos;
+                if remaining < 64 {
+                    let keep = (1u64 << remaining) - 1;
+                    commas &= keep;
+                    newlines &= keep;
+                    quotes &= keep;
                 }
+                let separators = commas | newlines;
+                let count = separators.count_ones() as usize;
+                let offset = (pos - start) as u32;
+                let left = (separators << 1) | (prev_seps >> 1);
+                let two_left = (separators << 2) | prev_seps;
+                let following_quote = (quotes << 1) | prev_quote;
+                // A wrapping quote must have a separator on exactly one side.
+                // Check at the following byte, so block boundaries need no lookahead.
+                let mut bad = following_quote & !(two_left ^ separators);
+                prev_seps = separators >> 62;
+                // Ones between separators propagate a field's opening quote to
+                // its terminating separator. A zero at that separator stops the
+                // carry. Overflow remembers an open field for the next block.
+                let openings = (quotes & left) | open_carry;
+                let (filled, carry) = (!separators).overflowing_add(openings);
+                open_carry = carry as u64;
+                bad |= separators & (filled ^ following_quote);
+                let closes = _pext_u64(following_quote, separators);
+                prev_quote = quotes >> 63;
+                while bad != 0 {
+                    self.errors.push(offset + bad.trailing_zeros());
+                    bad &= bad - 1;
+                }
+                let ends = _pext_u64(newlines, separators);
+                let dst = self.tags.as_mut_ptr().add(nsep);
+                let mut i = 0;
+                loop {
+                    let tags = _pdep_u64(closes >> i, BYTE_LSB) | _pdep_u64(ends >> i, BYTE_LSB << 1);
+                    dst.add(i).cast::<u64>().write_unaligned(tags);
+                    i += 8;
+                    if i >= count {
+                        break;
+                    }
+                }
+                write_positions::<WIDE>(self.seps.as_mut_ptr().add(nsep), offset, separators);
+                nsep += count;
+                pos += 64;
             }
-            write_positions::<WIDE>(self.seps.as_mut_ptr().add(nsep), offset, separators);
-            nsep += count;
-            pos += 64;
-            if pos >= soft_end && total != 0 {
-                break;
-            }
+        }
+        let mut total = nsep;
+        while total != 0 && *self.tags.as_ptr().add(total - 1) & 2 == 0 {
+            total -= 1;
         }
         self.total = total;
         self.seps.set_len(nsep);
@@ -262,4 +262,58 @@ pub unsafe fn line_start(buf: *const u8, len: usize, from: usize) -> usize {
         i += 1;
     }
     (i + 1).min(len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_pairs_across_vector_and_reservation_boundaries() {
+        let mut data = Vec::new();
+        let mut expected = Vec::new();
+        for padding in (0..128).chain([8190, 8191, 8192, 8200]) {
+            for (raw, value) in [
+                (&b"\"\""[..], Some(&b""[..])),
+                (b"\"x\"", Some(b"x")),
+                (b"x", Some(b"x")),
+                (b"\"", None),
+                (b"\"x", None),
+                (b"x\"", None),
+                (b"x\"y", None),
+                (b"\"x\"\"", None),
+            ] {
+                // The distinct row offset also catches an error spilling over
+                // from one malformed row to the next valid row.
+                let start = data.len();
+                data.extend_from_slice(b"id");
+                data.extend(std::iter::repeat_n(b'p', padding));
+                data.push(b',');
+                data.extend_from_slice(raw);
+                data.push(b'\n');
+                if let Some(field) = value {
+                    expected.push((start, field.to_vec()));
+                }
+            }
+        }
+        let len = data.len();
+        data.resize(len + 65, 0);
+        for wide in [false, Scan::new().wide] {
+            let mut scan = Scan::new();
+            scan.wide = wide;
+            let mut actual = Vec::new();
+            let mut pos = 0;
+            while pos < len {
+                unsafe {
+                    let next = scan.scan(data.as_ptr(), len, pos, (pos + 8192).min(len));
+                    rows::<2, _>(&scan, next - pos, |&[(start, _), (begin, end)]| {
+                        let field = &data[pos + begin as usize..pos + end as usize];
+                        actual.push((pos + start as usize, field.to_vec()));
+                    });
+                    pos = next;
+                }
+            }
+            assert_eq!(actual, expected);
+        }
+    }
 }

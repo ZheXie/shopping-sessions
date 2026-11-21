@@ -137,7 +137,7 @@ Hotspots (in order of impact):
 6. **Parquet write** — snappy/zstd, few large parts; no `_SUCCESS` needed
 7. **Cold start** — thin Docker image; no JVM; pre-warm nothing (no network at run)
 
-Container knobs already wired in `run.sh`: `POLARS_TEMP_DIR=/scratch`, `TMPDIR=/scratch`.
+The final image starts the Rust binary directly (`CMD ["/app/shopping-sessions"]`); it needs no scratch space.
 
 ### Phase 7 — Submit discipline
 
@@ -165,7 +165,7 @@ pipeline/
   write.py             # parquet schemas
 # later:
 src/                   # Rust crate mirroring the same stages
-Dockerfile             # CMD → run.sh → pipeline
+Dockerfile             # CMD → pipeline
 ```
 
 ---

@@ -12,9 +12,13 @@ Rust pipeline is the scored entry (`Dockerfile` → `/app/shopping-sessions`).
 
 | Check | Result |
 | --- | --- |
-| 36 fixtures | pass |
-| seed-1 1M `check-dev` | exact MATCH · ~1.0–1.1 s (8 threads, warm) |
-| ~20M local | ~25 s (8 threads) |
+| 36 fixtures (binary and Docker image) | pass |
+| seed-1 1M `check-dev` | exact MATCH · ~55 ms |
+| 20M events + 5M clicks | ~0.9 s in-process, ~1.1–1.3 s `docker run` wall |
+| 60M events + 15M clicks | ~3.1 s in-process, 9.5 GB RSS (5.4 GB of it the mapped input) |
+
+Timings are from a 4-core, 16 GB VM with a warm page cache; the scorer has 8 hyperthreads.
+5M, 20M and 30M outputs are identical to those of the first (slow, straightforward) Rust version.
 
 Python reference remains in `pipeline/pipeline.py` (correct but slow).
 
@@ -34,12 +38,19 @@ make fixtures-docker
 
 ## Architecture (speed path)
 
-1. mmap + custom CSV dialect (rules.md exact)
-2. Parallel per-file event/click parse → merge dedup
-3. Union-Find linked IDs → sessionize (30 min gap) → asof attribution + assists
-4. Aggregate → Snappy Parquet (`day` = Date32)
+1. `mmap` the inputs; AVX2 scan marks every `,` `\n` `"` (rules.md dialect, exact).
+2. Linked IDs: lock-free union-find in one open-addressing table keyed by a 64-bit ID hash;
+   afterwards each slot holds the person's key and name (smallest ID, inline up to 15 bytes).
+3. Parse in 2 MiB chunks on `NCPU` threads. Each event becomes a 16-byte dedup key (event-id
+   hash, ingest time) scattered by event-id hash and a 24-byte payload scattered by person.
+   Scatter uses write-combining buffers and non-temporal stores.
+4. Dedup per event-id partition; losers are flagged in their payload.
+5. Per person partition: group, sort, sessionize (30 min gap), credit and assists with a
+   sliding 7-day click window, emit `user_daily` rows; campaign totals are summed per thread.
+6. Own Parquet writer (PLAIN, uncompressed, `day` = DATE): one `user_daily` file per thread.
 
-Env: `DATA_DIR` / `OUTPUT_DIR` / `SCRATCH_DIR` / `NCPU`. Optional `SS_TIMING=1` for stage logs.
+The only dependency is `libc`. Env: `DATA_DIR` / `OUTPUT_DIR` / `NCPU`.
+`SS_TIMING=1` prints stage timings.
 
 ## Submit
 

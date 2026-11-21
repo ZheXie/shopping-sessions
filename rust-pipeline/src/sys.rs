@@ -169,6 +169,22 @@ impl<'a> Slab<'a> {
     }
 }
 
+/// Backs `[ptr, ptr + len)` with zeroed memory now. A region first touched by
+/// a read is mapped to the shared zero page and then never gets huge pages;
+/// writing it first does.
+pub fn populate_write(ptr: *mut u8, len: usize) {
+    const MADV_POPULATE_WRITE: libc::c_int = 23;
+    unsafe {
+        if libc::madvise(ptr as *mut libc::c_void, len, MADV_POPULATE_WRITE) != 0 {
+            let mut at = 0;
+            while at < len {
+                ptr.add(at).write_volatile(0);
+                at += PAGE;
+            }
+        }
+    }
+}
+
 /// Maps the file pages behind `[ptr, ptr + len)` in one call, which is cheaper
 /// than faulting them in one by one. Best effort.
 pub fn populate(ptr: *const u8, len: usize) {

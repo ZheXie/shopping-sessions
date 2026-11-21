@@ -1145,8 +1145,12 @@ fn main() {
             }
             unsafe { agg.partition(&pays[part], &clks[part]) };
         }
-        if agg.out.rows > 0 || t == 0 {
+        let t_parts = started.elapsed().as_secs_f64() * 1e3;
+        if (agg.out.rows > 0 || t == 0) && std::env::var("SS_NOWRITE").is_err() {
             write_user_file(&user_dir, t, &agg.out);
+        }
+        if timing {
+            eprintln!("  thread {t}: partitions done at {t_parts:.1} ms, file at {:.1} ms", started.elapsed().as_secs_f64() * 1e3);
         }
         (agg.out.rows, std::mem::take(&mut agg.out.camp))
     });
@@ -1168,6 +1172,20 @@ fn main() {
     lap("campaigns");
     if timing {
         eprintln!("{:>10} {:>8.1} ms", "total", started.elapsed().as_secs_f64() * 1e3);
+        if std::env::var("SS_SMAPS").is_ok() {
+            if let Ok(maps) = fs::read_to_string("/proc/self/smaps") {
+                let mut head = String::new();
+                let (mut size, mut rss) = (0u64, 0u64);
+                for line in maps.lines() {
+                    let num = || line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                    if line.starts_with("Size:") { size = num(); }
+                    else if line.starts_with("Rss:") { rss = num(); }
+                    else if line.starts_with("AnonHugePages:") {
+                        if rss > 16000 && !head.contains(".csv") { eprintln!("  {head} size={size}k rss={rss}k thp={}k", num()); }
+                    } else if line.split_whitespace().nth(1).map(|t| t.len() == 4 && t.ends_with('p')).unwrap_or(false) { head = line.to_string(); }
+                }
+            }
+        }
         if let Ok(roll) = fs::read_to_string("/proc/self/smaps_rollup") {
             for line in roll.lines().filter(|l| l.starts_with("Rss") || l.starts_with("AnonHuge") || l.starts_with("Anonymous")) {
                 eprintln!("  {line}");

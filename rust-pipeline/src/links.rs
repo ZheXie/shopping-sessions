@@ -10,7 +10,7 @@ use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
 use crate::hashx::r8;
-use crate::sys::{anon, par_map};
+use crate::sys::{anon, par_map, populate_write};
 
 /// An ID's bytes end at the first of these: IDs hold none of them and every
 /// field is followed by one.
@@ -256,7 +256,15 @@ impl Table {
         // At most 2 * total IDs, and usually far fewer.
         let cap = total * 9 / 4 + 16;
         assert!(cap < u32::MAX as usize, "too many links");
-        let table = Table { nodes: anon(cap * std::mem::size_of::<Node>()) as *mut Node, cap };
+        let bytes = cap * std::mem::size_of::<Node>();
+        let table = Table { nodes: anon(bytes) as *mut Node, cap };
+        let base = table.nodes as usize;
+        par_map(threads, |i| {
+            const HP: usize = 2 << 20;
+            let from = (bytes * i / threads) & !(HP - 1);
+            let to = if i + 1 == threads { bytes } else { (bytes * (i + 1) / threads) & !(HP - 1) };
+            populate_write((base + from) as *mut u8, to - from);
+        });
         // (list, first edge, last edge, index of the first edge overall)
         let mut tasks: Vec<(usize, usize, usize, usize)> = Vec::new();
         let mut seen = 0usize;

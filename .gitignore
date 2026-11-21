@@ -1,0 +1,19 @@
+# Generated / local data (never check in contest datasets)
+dev/
+out/
+scratch/
+/tmp/
+*.parquet
+
+# Python / Rust
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+target/
+.cargo/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

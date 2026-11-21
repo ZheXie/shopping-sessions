@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dirent.h>
+#include <mutex>
 #include <fcntl.h>
 #include <string>
 #include <sys/mman.h>
@@ -76,37 +77,36 @@ static const u64 K0 = 0xa0761d6478bd642fULL, K1 = 0xe7037ed1a0b428dbULL,
                  K2 = 0x8ebc6af09c88c6e3ULL, K3 = 0x589965cc75374cc3ULL;
 static inline u64 pow2ge(u64 x) { u64 c = 16; while (c < x) c <<= 1; return c; }
 
-// An ID: its first 16 bytes inline (zero padded), its length, and for IDs
-// longer than 16 bytes a pointer to a stable copy of all of it.
-struct K16 { u64 a, b; };
-struct Id {
-  K16 k; const char* lp; u32 n;
-};
-static inline K16 mkkey(const char* p, u32 n) {
-  K16 k{0, 0};
-  memcpy(&k, p, n < 16 ? n : 16);
-  return k;
-}
-static inline u64 hkey(const K16& k, const char* full, u32 n) {
-  u64 seed = K0 ^ ((u64)n * K3);
-  if (n > 16) {
-    for (u32 i = 16; i + 16 <= n; i += 16) seed = mum(ld64(full + i) ^ K1, ld64(full + i + 8) ^ seed);
-    u64 t[2] = {0, 0};
-    u32 r = (n - 16) % 16;
-    memcpy(t, full + n - r, r);
-    seed = mum(t[0] ^ K2, t[1] ^ seed);
+// wyhash-style hash of any byte string; reads only inside [p, p+n)
+static inline u64 ld32(const char* p) { u32 v; memcpy(&v, p, 4); return v; }
+static inline u64 hbytes(const char* p, u32 n, u64 seed0 = K0) {
+  u64 seed = seed0 ^ ((u64)n * K3);
+  u64 a, b;
+  if (n <= 16) {
+    if (n >= 8) { a = ld64(p); b = ld64(p + n - 8); }
+    else if (n >= 4) { a = (ld32(p) << 32) | ld32(p + n - 4); b = 0; }
+    else if (n > 0) { a = ((u64)(u8)p[0] << 16) | ((u64)(u8)p[n >> 1] << 8) | (u8)p[n - 1]; b = 0; }
+    else { a = b = 0; }
+  } else {
+    u32 i = n;
+    const char* q = p;
+    while (i > 16) { seed = mum(ld64(q) ^ K1, ld64(q + 8) ^ seed); q += 16; i -= 16; }
+    a = ld64(p + n - 16); b = ld64(p + n - 8);
   }
-  u64 h = mum(k.a ^ K1, k.b ^ seed);
+  u64 h = mum(a ^ K1, b ^ seed);
   return mum(h ^ K2, (u64)n ^ K1);
 }
-// exact equality of two IDs
-static inline bool ideq(const K16& x, u32 xn, const char* xlp, const K16& y, u32 yn, const char* ylp) {
-  return xn == yn && x.a == y.a && x.b == y.b && (xn <= 16 || memcmp(xlp + 16, ylp + 16, xn - 16) == 0);
-}
-// bytes of an ID for output / comparison
-static inline const char* idbytes(const K16& k, const char* lp, u32 n) { return n <= 16 ? (const char*)&k : lp; }
-// byte-wise lexicographic order
-static inline bool sless(const char* a, u32 an, const char* b, u32 bn) {
+static inline u64 hstr(const char* p, u32 n) { return hbytes(p, n); }
+
+// An ID in exactly 16 bytes plus a length byte L:
+//   L <= 16: the bytes themselves, zero padded (exact, no pointer)
+//   L == LONG: a = pointer to a LongId copy in an arena, b = hash of the bytes
+// Equal strings always get the same form, so comparing (L, a, b) is exact for
+// short IDs; long ones also compare their bytes.
+struct Id { u64 a, b; };
+struct LongId { u32 n; char s[4]; };
+static const u8 LONG = 255;
+static inline bool sless(const char* a, u32 an, const char* b, u32 bn) {  // byte-wise order
   u32 m = an < bn ? an : bn;
   int c = memcmp(a, b, m);
   return c < 0 || (c == 0 && an < bn);
@@ -114,7 +114,30 @@ static inline bool sless(const char* a, u32 an, const char* b, u32 bn) {
 static inline bool seq(const char* a, u32 an, const char* b, u32 bn) {
   return an == bn && (a == b || memcmp(a, b, an) == 0);
 }
-static inline u64 hstr(const char* p, u32 n) { return hkey(mkkey(p, n), p, n); }
+static inline u64 id_hash(const Id& k, u8 L) {
+  if (L == LONG) return k.b;
+  u64 h = mum(k.a ^ K1, k.b ^ K0 ^ ((u64)L * K3));
+  return mum(h ^ K2, (u64)L ^ K1);
+}
+static inline bool id_eq(const Id& x, u8 lx, const Id& y, u8 ly) {
+  if (lx != ly || x.b != y.b) return false;
+  if (lx != LONG) return x.a == y.a;
+  const LongId* p = (const LongId*)x.a;
+  const LongId* q = (const LongId*)y.a;
+  return p == q || (p->n == q->n && memcmp(p->s, q->s, p->n) == 0);
+}
+static inline const char* id_bytes(const Id& k, u8 L, u32& n) {
+  if (L != LONG) { n = L; return (const char*)&k; }
+  const LongId* p = (const LongId*)k.a;
+  n = p->n;
+  return p->s;
+}
+static inline bool id_less(const Id& x, u8 lx, const Id& y, u8 ly) {
+  u32 xn, yn;
+  const char* xp = id_bytes(x, lx, xn);
+  const char* yp = id_bytes(y, ly, yn);
+  return sless(xp, xn, yp, yn);
+}
 
 // ---------------------------------------------------------------- threads
 static int NT = 8;
@@ -135,32 +158,47 @@ static void parallel_for(size_t ntasks, F fn) {
 }
 
 // ---------------------------------------------------------------- arenas
-// Bump allocator over big anonymous mappings with transparent hugepages.
+// Bump allocator over 64 MB segments. A released arena returns its segments
+// to a shared pool and the next arena reuses them, so pages are faulted (and
+// zeroed by the kernel) once, not once per phase: without transparent
+// hugepages, faults and munmap are a large part of the run time.
+static const size_t SEG = (size_t)64 << 20;
+struct SegPool {
+  std::mutex m;
+  std::vector<char*> free, all;
+  char* get() {
+    {
+      std::lock_guard<std::mutex> g(m);
+      if (!free.empty()) { char* p = free.back(); free.pop_back(); return p; }
+    }
+    void* p = mmap(nullptr, SEG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) die("arena mmap");
+    if (!getenv("SS_NOTHP")) madvise(p, SEG, MADV_HUGEPAGE);
+    std::lock_guard<std::mutex> g(m);
+    all.push_back((char*)p);
+    return (char*)p;
+  }
+  void put(char* p) { std::lock_guard<std::mutex> g(m); free.push_back(p); }
+};
+static SegPool POOL;
 struct Arena {
-  std::vector<std::pair<char*, size_t>> segs;
+  std::vector<char*> segs;
   char* cur = nullptr;
   size_t left = 0;
   void* alloc(size_t n, size_t align = 64) {
     size_t pad = (align - ((uintptr_t)cur & (align - 1))) & (align - 1);
     if (n + pad > left) {
-      size_t sz = std::max(n + align, (size_t)64 << 20);
-      void* p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-      if (p == MAP_FAILED) die("arena mmap");
-      madvise(p, sz, MADV_HUGEPAGE);
-      segs.push_back({(char*)p, sz});
-      cur = (char*)p; left = sz; pad = 0;
+      if (n > SEG) die("allocation larger than a segment");
+      char* p = POOL.get();
+      segs.push_back(p);
+      cur = p; left = SEG; pad = 0;
     }
     void* r = cur + pad;
     cur += n + pad; left -= n + pad;
     return r;
   }
-  const char* copy(const char* p, u32 n) {
-    char* d = (char*)alloc(n, 8);
-    memcpy(d, p, n);
-    return d;
-  }
   void release() {
-    for (auto& s : segs) munmap(s.first, s.second);
+    for (char* s : segs) POOL.put(s);
     segs.clear(); cur = nullptr; left = 0;
   }
 };
@@ -391,19 +429,23 @@ struct NumMap {
 };
 
 // ---------------------------------------------------------------- records
-struct SvEv {  // a valid, non-late event copy, in its user-ID bucket
-  K16 uk; const char* ulp; u32 ulen, ts, price; u16 cat; u8 purch, dead;
+// A purchase is an event with price > 0 (a valid purchase costs at least 1).
+struct SvEv {  // a valid, non-late event copy, in its user-ID bucket (32 B)
+  Id uk; u32 ts, price, seq; u16 cat; u8 ul;
 };
-struct DEnt {  // dedup entry of a well-formed event copy, in its event-ID bucket
-  u64 eh; i64 ing; K16 ek; const char* elp; SvEv* rec; u32 elen;  // rec null: copy invalid
+struct DEnt {  // dedup entry of every well-formed event copy, in its event-ID bucket (20 B)
+  u32 h0, h1, h2;  // 96-bit hash of event_id
+  u32 ing;         // ingest_ts in seconds (relative)
+  u32 seq;         // copy number: thread << SEQB | local
 };
-struct ClRec {  // a valid click, in its user-ID bucket
-  u64 uh; K16 uk; const char* ulp; K16 ck; const char* clp; u32 ulen, ts, clen; u16 camp;
+static const int SEQB = 26;  // up to 64M event copies per thread
+struct ClRec {  // a valid click, in its user-ID bucket (40 B)
+  Id uk, ck; u32 ts; u16 camp; u8 ul, cl;
 };
-struct LSide { u64 h; K16 k; const char* lp; u32 n; u32 slot; };  // slot = edge*2+side
-struct PEv { u64 ph; K16 nk; const char* nlp; u32 nlen, ts, price; u16 cat; u8 purch; };
-struct PCl { u64 ph; K16 nk; const char* nlp; K16 ck; const char* clp; u32 nlen, ts, clen; u16 camp; };
-struct UserRow { K16 nk; const char* nlp; u32 nlen; int day; u32 sessions, events; i64 rev; int top; };
+struct LSide { Id k; u32 slot; u8 l; };  // slot = edge*2+side
+struct PEv { Id nk; u32 ts, price; u16 cat; u8 nl; };            // 32 B
+struct PCl { Id nk, ck; u32 ts; u16 camp; u8 nl, cl; };          // 40 B
+struct UserRow { Id nk; int day; u32 sessions, events; i64 rev; int top; u8 nl; };
 
 // ---------------------------------------------------------------- parquet writer
 struct TW {  // thrift compact protocol
@@ -681,14 +723,6 @@ static inline int split_line(const char* p, const char* fe, bool eof, Fld* f, in
   return split(p, le, f, nf) ? 1 : 0;
 }
 
-// An ID from a field: inline key, plus a stable copy when longer than 16.
-static inline Id make_id(const Fld& f, Arena& strs) {
-  Id r;
-  r.k = mkkey(f.p, f.n);
-  r.n = f.n;
-  r.lp = f.n > 16 ? strs.copy(f.p, f.n) : nullptr;
-  return r;
-}
 
 int main(int argc, char** argv) {
   const char* ev = getenv("DATA_DIR");
@@ -783,6 +817,26 @@ int main(int argc, char** argv) {
   }
   std::vector<Arena> arE(NT), arC(NT), arL(NT), arS(NT), arP(NT), arStr(NT);
   std::vector<Reader> readers(NT);
+  // An ID from a field (long ones are copied to the thread's string arena).
+  auto make_id = [](const Fld& f, Arena& strs, u8& L) -> Id {
+    Id r{0, 0};
+    if (f.n <= 16) {
+      // the reader leaves >= 256 readable bytes after the buffer: load 16, mask to n
+      static const u8 M[32] = {255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
+      __m128i v = _mm_loadu_si128((const __m128i*)f.p);
+      __m128i m = _mm_loadu_si128((const __m128i*)(M + 16 - f.n));
+      _mm_storeu_si128((__m128i*)&r, _mm_and_si128(v, m));
+      L = (u8)f.n;
+    } else {
+      LongId* q = (LongId*)strs.alloc(sizeof(LongId) + f.n, 8);
+      q->n = f.n;
+      memcpy(q->s, f.p, f.n);
+      r.a = (u64)q;
+      r.b = hbytes(f.p, f.n);
+      L = LONG;
+    }
+    return r;
+  };
   lap("open");
 
   // ---- phase L: links
@@ -800,16 +854,16 @@ int main(int argc, char** argv) {
       if (!r || f[0].n == 0 || f[1].n == 0) return next;
       u32 e = nedges[tid]++;
       for (int sd = 0; sd < 2; sd++) {
-        Id id = make_id(f[sd], AT);
-        u64 h = hkey(id.k, id.lp, id.n);
-        LB[h >> BSH].push(LSide{h, id.k, id.lp, id.n, e * 2 + sd}, AL);
+        u8 L;
+        Id id = make_id(f[sd], AT, L);
+        LB[id_hash(id, L) >> BSH].push(LSide{id, e * 2 + sd, L}, AL);
       }
       return next;
     });
   });
   lap("links");
 
-  struct LNode { u64 h; K16 k; const char* lp; u32 n; };
+  struct LNode { Id k; u64 h; u8 l; };
   std::vector<std::vector<LNode>> lnodes(NB);
   std::vector<std::vector<u32>> ltab(NB);  // slot -> local+1
   std::vector<u64> lmask(NB);
@@ -827,12 +881,13 @@ int main(int argc, char** argv) {
     for (int t = 0; t < NT; t++) {
       auto& EE = edgeEnd[t];
       lkb[t][b].each([&](LSide& s) {
+        u64 h = id_hash(s.k, s.l);
         u32 local = 0;
-        for (u64 i = s.h & mask;; i = (i + 1) & mask) {
+        for (u64 i = h & mask;; i = (i + 1) & mask) {
           u32 v = tab[i];
-          if (v == 0) { nodes.push_back(LNode{s.h, s.k, s.lp, s.n}); tab[i] = (u32)nodes.size(); local = (u32)nodes.size() - 1; break; }
+          if (v == 0) { nodes.push_back(LNode{s.k, h, s.l}); tab[i] = (u32)nodes.size(); local = (u32)nodes.size() - 1; break; }
           LNode& x = nodes[v - 1];
-          if (x.h == s.h && ideq(x.k, x.n, x.lp, s.k, s.n, s.lp)) { local = v - 1; break; }
+          if (x.h == h && id_eq(x.k, x.l, s.k, s.l)) { local = v - 1; break; }
         }
         if (local >= (1u << LBITS)) die("link bucket too large");
         EE[s.slot] = ((u32)b << LBITS) | local;
@@ -843,7 +898,7 @@ int main(int argc, char** argv) {
   lap("intern");
 
   // union-find on its own thread while events parse. Root = smallest ID.
-  struct PName { u64 h; K16 k; const char* lp; u32 n; };
+  struct PName { Id k; u8 l; };
   std::vector<std::vector<PName>> pnames(NB);
   std::vector<u32> base(NB + 1, 0);
   std::thread ufThread([&]() {
@@ -858,15 +913,12 @@ int main(int argc, char** argv) {
       while (par[x] != x) { par[x] = par[par[x]]; x = par[x]; }
       return x;
     };
-    auto nless = [&](const LNode* a, const LNode* b) {
-      return sless(idbytes(a->k, a->lp, a->n), a->n, idbytes(b->k, b->lp, b->n), b->n);
-    };
     for (int t = 0; t < NT; t++) {
       auto& E = edgeEnd[t];
       for (size_t i = 0; i < E.size(); i += 2) {
         u32 a = find(gid(E[i])), b = find(gid(E[i + 1]));
         if (a == b) continue;
-        if (nless(node[b], node[a])) std::swap(a, b);
+        if (id_less(node[b]->k, node[b]->l, node[a]->k, node[a]->l)) std::swap(a, b);
         par[b] = a;
       }
       std::vector<u32>().swap(E);
@@ -875,7 +927,7 @@ int main(int argc, char** argv) {
       pnames[b].resize(lnodes[b].size());
       for (u32 i = 0; i < lnodes[b].size(); i++) {
         const LNode* r = node[find(base[b] + i)];
-        pnames[b][i] = PName{r->h, r->k, r->lp, r->n};
+        pnames[b][i] = PName{r->k, r->l};
       }
     }
   });
@@ -884,7 +936,8 @@ int main(int argc, char** argv) {
   auto evb = make_buckets<DEnt>();
   auto svb = make_buckets<SvEv>();
   auto clb = make_buckets<ClRec>();
-  // biggest first for load balance
+  const i64 ING0 = WS / 1000 - ((i64)1 << 31);  // ingest seconds origin (u32 range around the window)
+  std::vector<u32> nseq(NT, 0);
   std::stable_sort(dataChunks.begin(), dataChunks.end(), [](const Chunk& a, const Chunk& b) { return a.e - a.b > b.e - b.b; });
   parallel_for(dataChunks.size(), [&](size_t ci, int tid) {
     const Chunk& c = dataChunks[ci];
@@ -902,23 +955,29 @@ int main(int argc, char** argv) {
         int sr = split_line(p, fe, eof, f, 7, &next);
         if (sr < 0) return nullptr;
         if (!sr || f[0].n == 0) return next;
+        if (nseq[tid] >= (1u << SEQB)) die("too many events for one thread");
         DEnt de;
-        Id eid = make_id(f[0], AT);
-        de.ek = eid.k; de.elp = eid.lp; de.elen = eid.n;
-        de.eh = hkey(eid.k, f[0].p, eid.n);
-        de.rec = nullptr;
+        {
+          u8 el;
+          Id ek = make_id(f[0], AT, el);
+          u64 h = id_hash(ek, el);
+          u32 h2 = el == LONG ? (u32)hbytes(f[0].p, f[0].n, K2) : (u32)mum(ek.a ^ K3, ek.b ^ K2 ^ el);
+          de.h0 = (u32)h; de.h1 = (u32)(h >> 32); de.h2 = h2;
+        }
+        de.seq = ((u32)tid << SEQB) | nseq[tid]++;
         i64 ing;
-        if (!parse_ts(f[3].p, f[3].n, ing)) ing = INT64_MAX;  // never happens: always valid F1
-        de.ing = ing;
+        // ingest_ts is always valid F1 (whole seconds); anything else sorts last
+        if (!parse_ts(f[3].p, f[3].n, ing)) ing = INT64_MAX;
+        i64 is = ing == INT64_MAX ? -1 : ing / 1000 - ING0;
+        de.ing = (is < 0 || is > (i64)UINT32_MAX) ? UINT32_MAX : (u32)is;
         SvEv r;
-        r.purch = 0; r.price = 0; r.dead = 0;
+        r.price = 0; r.seq = de.seq;
         i64 ts;
         bool ok = f[1].n > 0 && f[5].n > 0 && parse_ts(f[2].p, f[2].n, ts) && ts >= WS && ts < WE;
         if (ok) {
           const char* t = f[4].p; u32 tn = f[4].n;
           if (tn == 4 && (memcmp(t, "view", 4) == 0 || memcmp(t, "cart", 4) == 0)) {
           } else if (tn == 8 && memcmp(t, "purchase", 8) == 0) {
-            r.purch = 1;
             const char* q = f[6].p; u32 qn = f[6].n;
             if (qn == 0) ok = false;
             for (u32 i = 0; ok && i < qn; i++) if ((unsigned)(u8)q[i] - '0' > 9) ok = false;
@@ -937,16 +996,14 @@ int main(int argc, char** argv) {
         }
         if (ok && ing - ts > DAY_MS) ok = false;  // late: strictly over 24 h
         if (ok) {
-          Id uid = make_id(f[1], AT);
-          r.uk = uid.k; r.ulp = uid.lp; r.ulen = uid.n;
-          u64 uh = hkey(uid.k, f[1].p, uid.n);
+          r.uk = make_id(f[1], AT, r.ul);
           r.ts = (u32)(ts - WS);
           int pi = prodNum.find(f[5].p, f[5].n);
           if (pi == -2) pi = products.find(f[5].p, f[5].n);
           r.cat = (u16)(pi < 0 ? UNKNOWN_CAT : prodCat[pi]);
-          de.rec = SB[uh >> BSH].push(r, AS);
+          SB[id_hash(r.uk, r.ul) >> BSH].push(r, AS);
         }
-        EB[de.eh >> BSH].push(de, AE);
+        EB[de.h1 >> (BSH - 32)].push(de, AE);
         return next;
       });
     } else {
@@ -962,21 +1019,29 @@ int main(int argc, char** argv) {
         i64 ts;
         if (!parse_ts(f[3].p, f[3].n, ts) || ts < CWS || ts >= WE) return next;
         ClRec r;
-        Id uid = make_id(f[1], AT), cid = make_id(f[0], AT);
-        r.uk = uid.k; r.ulp = uid.lp; r.ulen = uid.n;
-        r.uh = hkey(uid.k, f[1].p, uid.n);
-        r.ck = cid.k; r.clp = cid.lp; r.clen = cid.n;
+        r.uk = make_id(f[1], AT, r.ul);
+        r.ck = make_id(f[0], AT, r.cl);
         r.ts = (u32)(ts - CWS); r.camp = (u16)camp;
-        CB[r.uh >> BSH].push(r, AC);
+        CB[id_hash(r.uk, r.ul) >> BSH].push(r, AC);
         return next;
       });
     }
   });
   lap("parse");
 
-  // ---- phase 2: dedup. The earliest ingest_ts wins; every other valid copy
-  // is marked dead (dedup comes before validation, so an invalid winner
-  // kills valid later copies too).
+  // ---- phase 2: dedup. The earliest ingest_ts wins; every other copy is
+  // marked dead in a per-thread bitmap of copy numbers (dedup comes before
+  // validation, so an invalid winner kills valid later copies too).
+  // Equal ingest_ts copies are identical, so either may win. Event IDs are
+  // compared by a 96-bit hash (collision odds ~1e-14 at 60M copies).
+  std::vector<std::vector<u64>> dead(NT);
+  for (int t = 0; t < NT; t++) dead[t].assign(nseq[t] / 64 + 1, 0);
+  auto kill = [&](u32 seq) {
+    __atomic_fetch_or(&dead[seq >> SEQB][(seq & ((1u << SEQB) - 1)) >> 6], (u64)1 << (seq & 63), __ATOMIC_RELAXED);
+  };
+  auto isDead = [&](u32 seq) -> bool {
+    return (dead[seq >> SEQB][(seq & ((1u << SEQB) - 1)) >> 6] >> (seq & 63)) & 1;
+  };
   parallel_for(NB, [&](size_t b, int) {
     struct DT { u64 h; DEnt* d; };
     static thread_local std::vector<DT> tab;
@@ -987,16 +1052,13 @@ int main(int argc, char** argv) {
     u64 mask = cap - 1;
     for (int t = 0; t < NT; t++) {
       evb[t][b].each([&](DEnt& r) {
-        for (u64 i = r.eh & mask;; i = (i + 1) & mask) {
+        u64 h = ((u64)r.h1 << 32) | r.h0;
+        for (u64 i = h & mask;; i = (i + 1) & mask) {
           DT& x = tab[i];
-          if (!x.d) { x.h = r.eh; x.d = &r; return; }
-          if (x.h == r.eh && ideq(x.d->ek, x.d->elen, x.d->elp, r.ek, r.elen, r.elp)) {
-            if (r.ing < x.d->ing) {
-              if (x.d->rec) x.d->rec->dead = 1;
-              x.d = &r;
-            } else if (r.rec) {
-              r.rec->dead = 1;
-            }
+          if (!x.d) { x.h = h; x.d = &r; return; }
+          if (x.h == h && x.d->h2 == r.h2) {
+            if (r.ing < x.d->ing) { kill(x.d->seq); x.d = &r; }
+            else kill(r.seq);
             return;
           }
         }
@@ -1016,15 +1078,17 @@ int main(int argc, char** argv) {
     auto& nodes = lnodes[b];
     auto& pn = pnames[b];
     u64 mask = lmask[b];
-    auto person = [&](u64 h, const K16& k, const char* lp, u32 n, u64& ph, K16& nk, const char*& nlp, u32& nn) {
+    // person name of an ID and its hash
+    auto person = [&](const Id& k, u8 l, Id& nk, u8& nl) -> u64 {
+      u64 h = id_hash(k, l);
       for (u64 i = h & mask;; i = (i + 1) & mask) {
         u32 v = tab[i];
-        if (v == 0) { ph = h; nk = k; nlp = lp; nn = n; return; }
+        if (v == 0) { nk = k; nl = l; return h; }
         LNode& x = nodes[v - 1];
-        if (x.h == h && ideq(x.k, x.n, x.lp, k, n, lp)) {
+        if (x.h == h && id_eq(x.k, x.l, k, l)) {
           const PName& r = pn[v - 1];
-          ph = r.h; nk = r.k; nlp = r.lp; nn = r.n;
-          return;
+          nk = r.k; nl = r.l;
+          return id_hash(nk, nl);
         }
       }
     };
@@ -1033,17 +1097,17 @@ int main(int argc, char** argv) {
     Arena& AP = arP[tid];
     for (int t = 0; t < NT; t++) {
       svb[t][b].each([&](SvEv& e) {
-        if (e.dead) return;
+        if (isDead(e.seq)) return;
         PEv o;
-        person(hkey(e.uk, e.ulp, e.ulen), e.uk, e.ulp, e.ulen, o.ph, o.nk, o.nlp, o.nlen);
-        o.ts = e.ts; o.price = e.price; o.cat = e.cat; o.purch = e.purch;
-        PE[o.ph >> BSH].push(o, AP);
+        u64 ph = person(e.uk, e.ul, o.nk, o.nl);
+        o.ts = e.ts; o.price = e.price; o.cat = e.cat;
+        PE[ph >> BSH].push(o, AP);
       });
       clb[t][b].each([&](ClRec& c) {
         PCl o;
-        person(c.uh, c.uk, c.ulp, c.ulen, o.ph, o.nk, o.nlp, o.nlen);
-        o.ck = c.ck; o.clp = c.clp; o.clen = c.clen; o.ts = c.ts; o.camp = c.camp;
-        PC[o.ph >> BSH].push(o, AP);
+        u64 ph = person(c.uk, c.ul, o.nk, o.nl);
+        o.ck = c.ck; o.cl = c.cl; o.ts = c.ts; o.camp = c.camp;
+        PC[ph >> BSH].push(o, AP);
       });
     }
   });
@@ -1057,12 +1121,14 @@ int main(int argc, char** argv) {
   std::vector<std::vector<CD>> cdT(NT, std::vector<CD>(NCD, CD{0, 0, 0, 0}));
   std::vector<std::vector<UserRow>> urT(NT);
   parallel_for(NB, [&](size_t b, int tid) {
-    struct PT { u64 h; K16 k; const char* lp; u32 n; u32 idx; };
-    struct E { u32 ts, price; u16 cat; u8 purch; };
-    struct C { u32 ts; u16 camp; u32 clen; K16 ck; const char* clp; };
+    struct PT { Id k; u32 idx; u8 l; };
+    struct E { u32 ts, price; u16 cat; };
+    struct C { Id ck; u32 ts; u16 camp; u8 cl; };
     struct S { u32 start; int day; i64 rev; u8 purch; };
     static thread_local std::vector<PT> tab;
-    static thread_local std::vector<u32> ecount, ccount, eidx, cidx, eoff, coff, pos, pslot;
+    struct PK { Id k; u8 l; };
+    static thread_local std::vector<PK> pkeys;
+    static thread_local std::vector<u32> ecount, ccount, eidx, cidx, eoff, coff, pos;
     static thread_local std::vector<E> ev;
     static thread_local std::vector<C> cl;
     static thread_local std::vector<S> ss;
@@ -1078,30 +1144,45 @@ int main(int argc, char** argv) {
     size_t tot = 0, totc = 0;
     for (int t = 0; t < NT; t++) { tot += peb[t][b].cnt; totc += pcb[t][b].cnt; }
     if (tot == 0) return;
-    tab.assign(pow2ge(tot + 1), PT{0, K16{0, 0}, nullptr, 0, UINT32_MAX});
+    // person table: sized for persons (not events) and grown at load 1/2,
+    // so it stays in L2
+    tab.assign(pow2ge(tot / 16 + 64), PT{Id{0, 0}, UINT32_MAX, 0});
     u64 mask = tab.size() - 1;
-    ecount.clear(); pslot.clear();
+    ecount.clear(); pkeys.clear();
     eidx.resize(tot); cidx.resize(totc);
-    auto lookup = [&](u64 h, const K16& kk, const char* lp, u32 n, bool ins) -> u32 {
-      for (u64 i = (h * 0x9E3779B97F4A7C15ULL >> 20) & mask;; i = (i + 1) & mask) {
+    auto slot = [&](u64 h) { return (h * 0x9E3779B97F4A7C15ULL) >> 20; };
+    auto grow = [&]() {
+      tab.assign(tab.size() * 2, PT{Id{0, 0}, UINT32_MAX, 0});
+      mask = tab.size() - 1;
+      for (u32 id = 0; id < pkeys.size(); id++) {
+        u64 i = slot(id_hash(pkeys[id].k, pkeys[id].l)) & mask;
+        while (tab[i].idx != UINT32_MAX) i = (i + 1) & mask;
+        tab[i] = PT{pkeys[id].k, id, pkeys[id].l};
+      }
+    };
+    auto lookup = [&](const Id& kk, u8 l, bool ins) -> u32 {
+      u64 h = id_hash(kk, l);
+      for (u64 i = slot(h) & mask;; i = (i + 1) & mask) {
         PT& x = tab[i];
         if (x.idx == UINT32_MAX) {
           if (!ins) return UINT32_MAX;
-          x.h = h; x.k = kk; x.lp = lp; x.n = n; x.idx = (u32)ecount.size();
-          ecount.push_back(0); pslot.push_back((u32)i);
-          return x.idx;
+          u32 id = (u32)ecount.size();
+          x.k = kk; x.l = l; x.idx = id;
+          ecount.push_back(0); pkeys.push_back(PK{kk, l});
+          if (pkeys.size() * 2 > tab.size()) grow();
+          return id;
         }
-        if (x.h == h && ideq(x.k, x.n, x.lp, kk, n, lp)) return x.idx;
+        if (id_eq(x.k, x.l, kk, l)) return x.idx;
       }
     };
     size_t k = 0;
     for (int t = 0; t < NT; t++)
-      peb[t][b].each([&](PEv& e) { u32 id = lookup(e.ph, e.nk, e.nlp, e.nlen, true); ecount[id]++; eidx[k++] = id; });
+      peb[t][b].each([&](PEv& e) { u32 id = lookup(e.nk, e.nl, true); ecount[id]++; eidx[k++] = id; });
     u32 NP = (u32)ecount.size();
     ccount.assign(NP, 0);
     k = 0;
     for (int t = 0; t < NT; t++)
-      pcb[t][b].each([&](PCl& c) { u32 id = lookup(c.ph, c.nk, c.nlp, c.nlen, false); cidx[k++] = id; if (id != UINT32_MAX) ccount[id]++; });
+      pcb[t][b].each([&](PCl& c) { u32 id = lookup(c.nk, c.nl, false); cidx[k++] = id; if (id != UINT32_MAX) ccount[id]++; });
     eoff.assign(NP + 1, 0); coff.assign(NP + 1, 0);
     for (u32 i = 0; i < NP; i++) { eoff[i + 1] = eoff[i] + ecount[i]; coff[i + 1] = coff[i] + ccount[i]; }
     ev.resize(tot);
@@ -1109,16 +1190,16 @@ int main(int argc, char** argv) {
     pos.assign(eoff.begin(), eoff.end() - 1);
     k = 0;
     for (int t = 0; t < NT; t++)
-      peb[t][b].each([&](PEv& e) { ev[pos[eidx[k++]]++] = E{e.ts, e.price, e.cat, e.purch}; });
+      peb[t][b].each([&](PEv& e) { ev[pos[eidx[k++]]++] = E{e.ts, e.price, e.cat}; });
     pos.assign(coff.begin(), coff.end() - 1);
     k = 0;
     for (int t = 0; t < NT; t++)
-      pcb[t][b].each([&](PCl& c) { u32 id = cidx[k++]; if (id != UINT32_MAX) cl[pos[id]++] = C{c.ts, c.camp, c.clen, c.ck, c.clp}; });
+      pcb[t][b].each([&](PCl& c) { u32 id = cidx[k++]; if (id != UINT32_MAX) cl[pos[id]++] = C{c.ck, c.ts, c.camp, c.cl}; });
 
     auto& CDt = cdT[tid];
     auto& UR = urT[tid];
     for (u32 pi = 0; pi < NP; pi++) {
-      const PT& who = tab[pslot[pi]];
+      const PK& who = pkeys[pi];
       E* e0 = &ev[eoff[pi]];
       u32 ne = eoff[pi + 1] - eoff[pi];
       std::sort(e0, e0 + ne, [](const E& a, const E& c) { return a.ts < c.ts; });
@@ -1127,7 +1208,7 @@ int main(int argc, char** argv) {
       if (nc > 1)
         std::sort(c0, c0 + nc, [](const C& a, const C& c) {
           if (a.ts != c.ts) return a.ts < c.ts;
-          return sless(idbytes(a.ck, a.clp, a.clen), a.clen, idbytes(c.ck, c.clp, c.clen), c.clen);
+          return id_less(a.ck, a.cl, c.ck, c.cl);
         });
 
       // sessionize + user_daily
@@ -1145,7 +1226,7 @@ int main(int argc, char** argv) {
           catsum[c] = 0;
         }
         cattouch.clear();
-        UR.push_back(UserRow{who.k, who.lp, who.n, curDay, dSess, dEv, dRev, top});
+        UR.push_back(UserRow{who.k, curDay, dSess, dEv, dRev, top, who.l});
       };
       u32 prev = 0;
       for (u32 i = 0; i < ne; i++) {
@@ -1158,7 +1239,7 @@ int main(int argc, char** argv) {
         }
         prev = x.ts;
         dEv++;
-        if (x.purch) {
+        if (x.price) {
           S& s = ss.back();
           s.rev += x.price; s.purch = 1;
           dRev += x.price;
@@ -1284,15 +1365,15 @@ int main(int argc, char** argv) {
     for (size_t s = 0; s < rows.size(); s += RG) {
       size_t e = std::min(rows.size(), s + RG);
       std::vector<ColBuf> cb(6);
-      size_t sb = 0;
-      for (size_t i = s; i < e; i++) sb += rows[i].nlen + 4;
-      cb[0].data.reserve(sb);
+      cb[0].data.reserve((e - s) * 16);
       cb[1].data.reserve((e - s) * 4); cb[2].data.reserve((e - s) * 4);
       cb[3].data.reserve((e - s) * 4); cb[4].data.reserve((e - s) * 8);
       cb[5].defs.resize(e - s);
       for (size_t i = s; i < e; i++) {
         const UserRow& r = rows[i];
-        put_str(cb[0], idbytes(r.nk, r.nlp, r.nlen), r.nlen);
+        u32 n;
+        const char* nb = id_bytes(r.nk, r.nl, n);
+        put_str(cb[0], nb, n);
         put_i32(cb[1], r.day);
         put_i32(cb[2], (int32_t)r.sessions);
         put_i32(cb[3], (int32_t)r.events);
@@ -1312,6 +1393,13 @@ int main(int argc, char** argv) {
       if (strstr(line, "Rss") || strstr(line, "AnonHuge") || strstr(line, "Anonymous")) fputs(line, stderr);
     if (f) fclose(f);
   }
+  // Unmap the big segments from several threads: munmap zaps page tables
+  // under a shared lock, so this runs in parallel, unlike the exit teardown.
+  if (!getenv("SS_SERIAL_EXIT")) {
+    std::vector<char*> segs = POOL.all;
+    parallel_for(segs.size(), [&](size_t i, int) { munmap(segs[i], SEG); });
+    lap("unmap");
+  }
   fflush(stdout);
-  _exit(0);  // skip destructors: the OS reclaims everything
+  _exit(0);  // skip destructors: the OS reclaims the rest
 }

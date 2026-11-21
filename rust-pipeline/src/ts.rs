@@ -23,7 +23,7 @@ const SLOTS: usize = 128;
 pub struct Dates {
     head: [u64; SLOTS],
     tail: [u16; SLOTS],
-    ms: [i64; SLOTS],
+    seconds: [i64; SLOTS],
 }
 
 impl Dates {
@@ -31,7 +31,7 @@ impl Dates {
         Dates {
             head: [0; SLOTS],
             tail: [0; SLOTS],
-            ms: [BAD; SLOTS],
+            seconds: [BAD; SLOTS],
         }
     }
 
@@ -63,27 +63,47 @@ impl Dates {
         if day > len {
             return BAD;
         }
-        let ms = days_from_civil(y, m, day) * DAY_MS;
+        let seconds = days_from_civil(y, m, day) * (DAY_MS / 1000);
         self.head[slot] = r8(p);
         self.tail[slot] = (p.add(8) as *const u16).read_unaligned();
-        self.ms[slot] = ms;
-        ms
+        self.seconds[slot] = seconds;
+        seconds
     }
 
-    /// `YYYY-MM-DDTHH:MM:SS` at `p` (19 readable bytes) as UTC ms, or `BAD`.
+    /// UTC midnight in epoch seconds, or `BAD`.
     #[inline(always)]
-    unsafe fn datetime(&mut self, p: *const u8) -> i64 {
+    unsafe fn midnight(&mut self, p: *const u8) -> i64 {
         let head = r8(p);
         let tail = (p.add(8) as *const u16).read_unaligned();
         // Low bits of the day's two digits and of the month's last digit.
         let slot =
             (((tail >> 8) & 0xF) | ((tail & 3) << 4) | (((head >> 48) as u16 & 1) << 6)) as usize;
-        let day =
-            if *self.head.get_unchecked(slot) == head && *self.tail.get_unchecked(slot) == tail {
-                *self.ms.get_unchecked(slot)
-            } else {
-                self.miss(p, slot)
-            };
+        if *self.head.get_unchecked(slot) == head && *self.tail.get_unchecked(slot) == tail {
+            *self.seconds.get_unchecked(slot)
+        } else {
+            self.miss(p, slot)
+        }
+    }
+
+    /// Every ingest timestamp in a well-formed event is a valid F1 per the
+    /// input contract. Decode its six clock digits without testing them again.
+    #[inline(always)]
+    pub unsafe fn ingest_seconds(&mut self, p: *const u8, len: usize) -> i64 {
+        if len != 20 {
+            return BAD;
+        }
+        let day = self.midnight(p);
+        if day == BAD {
+            return BAD;
+        }
+        let x = r8(p.add(11)) ^ 0x3030_3A30_303A_3030;
+        let y = x.wrapping_mul(2561);
+        day + (((y >> 8) & 255) * 3600 + ((y >> 32) & 255) * 60 + (y >> 56)) as i64
+    }
+
+    #[inline(always)]
+    unsafe fn datetime(&mut self, p: *const u8) -> i64 {
+        let day = self.midnight(p);
         // `HH:MM:SS` at once: after the xor a digit byte is 0..=9 and a colon
         // byte is 0; adding 0x76 (or 0x7F) sets the top bit of any other.
         let x = r8(p.add(11)) ^ 0x3030_3A30_303A_3030;
@@ -94,7 +114,7 @@ impl Dates {
         if (bad != 0) | (*p.add(10) != b'T') | (h > 23) | (m > 59) | (s > 59) | (day == BAD) {
             return BAD;
         }
-        day + ((h * 3600 + m * 60 + s) * 1000) as i64
+        (day + (h * 3600 + m * 60 + s) as i64) * 1000
     }
 
     /// Epoch milliseconds, or `BAD`. Needs 25 readable bytes at `p`.

@@ -119,49 +119,43 @@ impl EventReader {
     /// Returns (bytes, file offset of the first line, length); `SLACK`
     /// readable bytes follow. Same lines as `line_start(a)..line_start(b)`.
     pub fn read_lines(&mut self, path: &Path, buf: Buf, a: usize, b: usize) -> (*const u8, usize, usize) {
-        const EXTRA: usize = 16 << 10;
+        // A short overlap covers ordinary records. Only the task that owns
+        // the beginning of a long line extends its read past the overlap.
+        const EXTRA: usize = 256;
         let id = buf.ptr as usize;
         if self.file.as_ref().map(|(key, _)| *key) != Some(id) {
-            let f = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
-            self.file = Some((id, f));
+            let file = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+            self.file = Some((id, file));
         }
+        let file = &self.file.as_ref().unwrap().1;
         let lo = a.saturating_sub(1);
-        let mut hi = (b + EXTRA).min(buf.len);
-        loop {
-            let n = hi - lo;
-            if self.bytes.len() < n + SLACK {
-                self.bytes.resize(n + SLACK, 0);
+        let read_to = |bytes: &mut Vec<u8>, from: usize, to: usize| {
+            if bytes.len() < to + SLACK {
+                bytes.resize(to + SLACK, 0);
             }
-            self.file
-                .as_ref()
-                .unwrap()
-                .1
-                .read_exact_at(&mut self.bytes[..n], lo as u64)
-                .unwrap_or_else(|e| panic!("read {} at {lo}: {e}", path.display()));
-            let data = &self.bytes[..n];
-            // First line start at or after a: just past the first '\n' at or after a - 1.
-            let start = match data.iter().position(|&c| c == b'\n') {
-                Some(i) => lo + i + 1,
-                None if hi == buf.len => return (self.bytes.as_ptr(), buf.len, 0),
-                None => {
-                    hi = (hi + (hi - lo)).min(buf.len);
-                    continue;
-                }
-            };
-            let from = b.saturating_sub(1).max(lo) - lo;
-            let end = match data[from..].iter().position(|&c| c == b'\n') {
-                Some(i) => (lo + from + i + 1).min(buf.len),
-                None if hi == buf.len => buf.len,
-                None => {
-                    hi = (hi + (hi - lo)).min(buf.len);
-                    continue;
-                }
-            };
-            if end <= start {
-                return (self.bytes.as_ptr(), start, 0);
+            file.read_exact_at(&mut bytes[from..to], (lo + from) as u64)
+                .unwrap_or_else(|e| panic!("read {} at {}: {e}", path.display(), lo + from));
+        };
+        let mut len = (b + EXTRA).min(buf.len) - lo;
+        read_to(&mut self.bytes, 0, len);
+        // Only line starts strictly before b belong to this task.
+        let boundary = b - 1 - lo;
+        let Some(newline) = self.bytes[..boundary].iter().position(|&byte| byte == b'\n') else {
+            return (self.bytes.as_ptr(), b, 0);
+        };
+        let start = newline + 1;
+        let mut search = boundary;
+        let end = loop {
+            if let Some(newline) = self.bytes[search..len].iter().position(|&byte| byte == b'\n') {
+                break search + newline + 1;
             }
-            return (unsafe { self.bytes.as_ptr().add(start - lo) }, start, end - start);
-        }
+            // Buffered files end with a newline.
+            debug_assert!(lo + len < buf.len);
+            search = len;
+            len = (len * 2).min(buf.len - lo);
+            read_to(&mut self.bytes, search, len);
+        };
+        (unsafe { self.bytes.as_ptr().add(start) }, lo + start, end - start)
     }
 }
 
@@ -430,7 +424,7 @@ unsafe fn big_map(size: usize) -> *mut u8 {
 unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     #[inline]
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if layout.size() >= BIG && layout.align() <= HUGE {
+        if layout.size() >= BIG && layout.align() <= PAGE {
             big_map(layout.size())
         } else {
             std::alloc::System.alloc(layout)
@@ -438,7 +432,7 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     }
     #[inline]
     unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if layout.size() >= BIG && layout.align() <= HUGE {
+        if layout.size() >= BIG && layout.align() <= PAGE {
             big_map(layout.size()) // fresh anonymous memory is zero
         } else {
             std::alloc::System.alloc_zeroed(layout)
@@ -446,7 +440,7 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     }
     #[inline]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
-        if layout.size() >= BIG && layout.align() <= HUGE {
+        if layout.size() >= BIG && layout.align() <= PAGE {
             libc::munmap(ptr as *mut libc::c_void, big_len(layout.size()));
         } else {
             std::alloc::System.dealloc(ptr, layout)
@@ -454,8 +448,8 @@ unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         let align = layout.align();
-        let old_big = layout.size() >= BIG && align <= HUGE;
-        let new_big = new_size >= BIG && align <= HUGE;
+        let old_big = layout.size() >= BIG && align <= PAGE;
+        let new_big = new_size >= BIG && align <= PAGE;
         match (old_big, new_big) {
             (false, false) => std::alloc::System.realloc(ptr, layout, new_size),
             (true, true) => {

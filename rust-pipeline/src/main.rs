@@ -11,6 +11,7 @@
 //! 4. One person partition at a time: sessionize, attribute, aggregate, and
 //!    write Parquet.
 
+mod click;
 mod dim;
 mod event_key;
 mod hashx;
@@ -28,9 +29,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
+use click::Click;
 use dim::SmallTab;
 use hashx::{r4, r8};
-use links::{id_bytes, name_hash, same_name, Edge, Name, Table, ADDR};
+use links::{name_hash, same_name, Edge, Name, Table};
 use pq::{bytes_of, Col, Kind};
 use scan::Scan;
 use sys::{par_map, Arena, Blk, Buf, PartWriter, Slab};
@@ -66,75 +68,17 @@ struct Pay {
     w: u64,
 }
 
-/// A valid click. `cp` is the address of the click id with the campaign index
-/// on top; `t` is `ts - (window_start - 7 days)`; `key` is the click id as an
-/// order-preserving key (see `click_key`), 0 when it does not fit one.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Clk {
     name: Name,
-    cp: u64,
-    t: u64,
-    key: u64,
-}
-
-/// A click id of 1 to 10 bytes of `[0-9A-Za-z]` as one exact key whose
-/// integer order is the ids' byte order: each byte is a 6-bit symbol 1..=62
-/// in ASCII order ('0'..'9', 'A'..'Z', 'a'..'z'), first byte most
-/// significant, missing bytes 0 (below every symbol, so a prefix sorts
-/// first). Anything else is 0 and compares by its bytes. Tie-breaks between
-/// clicks at the same millisecond then never read the input mapping.
-/// `p` has 16 readable bytes.
-#[inline(always)]
-unsafe fn click_key(p: *const u8, n: usize) -> u64 {
-    use std::arch::x86_64::*;
-    if n == 0 || n > 10 {
-        return 0;
-    }
-    let v = _mm_loadu_si128(p.cast());
-    let live = _mm_cmpgt_epi8(
-        _mm_set1_epi8(n as i8),
-        _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
-    );
-    let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
-    let u = _mm_sub_epi8(v, _mm_set1_epi8(b'A' as i8));
-    let l = _mm_sub_epi8(v, _mm_set1_epi8(b'a' as i8));
-    let isd = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
-    let isu = _mm_cmpeq_epi8(_mm_min_epu8(u, _mm_set1_epi8(25)), u);
-    let isl = _mm_cmpeq_epi8(_mm_min_epu8(l, _mm_set1_epi8(25)), l);
-    if _mm_movemask_epi8(_mm_andnot_si128(_mm_or_si128(_mm_or_si128(isd, isu), isl), live)) != 0 {
-        return 0;
-    }
-    let sym = _mm_and_si128(
-        _mm_or_si128(
-            _mm_or_si128(
-                _mm_and_si128(isd, _mm_add_epi8(d, _mm_set1_epi8(1))),
-                _mm_and_si128(isu, _mm_add_epi8(u, _mm_set1_epi8(11))),
-            ),
-            _mm_and_si128(isl, _mm_add_epi8(l, _mm_set1_epi8(37))),
-        ),
-        live,
-    );
-    let t = _mm_maddubs_epi16(sym, _mm_set1_epi16(0x0140)); // s0*64 + s1
-    let q = _mm_madd_epi16(t, _mm_set1_epi32(0x0001_1000)); // 4 symbols in 24 bits
-    let q01 = _mm_cvtsi128_si64(q) as u64;
-    let q2 = _mm_extract_epi32::<2>(q) as u32 as u64;
-    ((q01 & 0xFF_FFFF) << 36) | ((q01 >> 32) << 12) | (q2 >> 12)
-}
-
-/// Click a sorts before click b by click id (both at the same time).
-#[inline(always)]
-unsafe fn click_before(a: &(u64, u64, u64), b: &(u64, u64, u64)) -> bool {
-    if a.2 != 0 && b.2 != 0 {
-        a.2 < b.2
-    } else {
-        id_bytes(a.1 & ADDR) < id_bytes(b.1 & ADDR)
-    }
+    click: Click,
 }
 
 struct Ctx {
     arena: Arena,
     w0: i64,
+    ingest_origin: i64,
     /// Length of the event window in ms.
     wlen: u64,
     links: Table,
@@ -163,9 +107,7 @@ struct EvStage {
 struct ClStage {
     uh: u64,
     name: Name,
-    cp: u64,
-    t: u64,
-    key: u64,
+    click: Click,
 }
 
 struct Work<'a> {
@@ -421,7 +363,7 @@ unsafe fn event_row(
     }
     let ingest = w
         .dates
-        .parse(base.add(f[3].0 as usize), (f[3].1 - f[3].0) as usize);
+        .ingest_seconds(base.add(f[3].0 as usize), (f[3].1 - f[3].0) as usize);
     if ingest == ts::BAD {
         return;
     }
@@ -438,7 +380,7 @@ unsafe fn event_row(
     let mut valid = (user_len != 0)
         & (f[5].1 != f[5].0)
         & (rel < ctx.wlen)
-        & (ingest.wrapping_sub(t) <= DAY as i64);
+        & ((ingest * 1000).wrapping_sub(t) <= DAY as i64);
     let ty = base.add(f[4].0 as usize);
     let ty_len = f[4].1 - f[4].0;
     let mut price = 0u64;
@@ -454,7 +396,7 @@ unsafe fn event_row(
     let s = w.ev.get_unchecked_mut(w.nev);
     s.eh = eh;
     s.part = eh2;
-    s.ingest = (ingest - ctx.w0).div_euclid(1000) + (1 << 31);
+    s.ingest = ingest - ctx.ingest_origin;
     s.valid = valid;
     if valid {
         let up = base.add(f[1].0 as usize);
@@ -525,9 +467,8 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, source: *const u8,
     let s = w.cl.get_unchecked_mut(w.ncl);
     s.name = links::name_at(up, user_len, source.add(f[1].0 as usize));
     s.uh = name_hash(s.name);
-    s.cp = (source.add(f[0].0 as usize) as u64) | ((camp as u64) << 48);
-    s.key = click_key(base.add(f[0].0 as usize), (f[0].1 - f[0].0) as usize);
-    s.t = rel;
+    s.click = Click::new(rel, camp, base.add(f[0].0 as usize),
+                         (f[0].1 - f[0].0) as usize, source.add(f[0].0 as usize));
     ctx.links.prefetch(s.uh);
     w.ncl += 1;
     if w.ncl == BATCH {
@@ -546,9 +487,7 @@ unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
             &mut w.slab,
             Clk {
                 name,
-                cp: s.cp,
-                t: s.t,
-                key: s.key,
+                click: s.click,
             },
         );
     }
@@ -649,9 +588,9 @@ struct Agg<'a> {
     ev_idx: Vec<u32>,
     ev_w: Vec<u64>,
     ck_idx: Vec<u32>,
-    ck_raw: Vec<(u64, u64, u64)>,
+    ck_raw: Vec<Click>,
     evs: Vec<u64>,
-    cks: Vec<(u64, u64, u64)>,
+    cks: Vec<Click>,
     cnt: Vec<u32>,
     act: Vec<u32>,
     days: Vec<(u32, u32)>,
@@ -781,7 +720,7 @@ impl<'a> Agg<'a> {
                     if same_name(*self.names.get_unchecked(s as usize - 1), name) {
                         *self.ck_end.get_unchecked_mut(s as usize - 1) += 1;
                         self.ck_idx.push(s - 1);
-                        self.ck_raw.push((c.t, c.cp, c.key));
+                        self.ck_raw.push(c.click);
                         break;
                     }
                     slot = (slot + 1) & mask;
@@ -814,7 +753,7 @@ impl<'a> Agg<'a> {
         }
         let nck = self.ck_raw.len();
         if self.cks.len() < nck {
-            self.cks.resize(nck, (0, 0, 0));
+            self.cks.resize(nck, Click::default());
         }
         for i in 0..nck {
             let at = self
@@ -838,9 +777,9 @@ impl<'a> Agg<'a> {
             }
             let clicks = &mut self.cks[ck_at..ck_to];
             if clicks.len() >= 1024 && self.ctx.wlen + WEEK < 1 << 33 {
-                time_sort::radix_time(clicks, &mut self.ck_raw, |c| c.0);
+                time_sort::radix_time(clicks, &mut self.ck_raw, Click::time);
             } else if clicks.len() > 1 {
-                clicks.sort_unstable_by_key(|c| c.0);
+                clicks.sort_unstable_by_key(|c| c.time());
             }
             self.person(*self.names.get_unchecked(p), ev_at, ev_to, ck_at, ck_to);
             ev_at = ev_to;
@@ -959,8 +898,8 @@ impl<'a> Agg<'a> {
             // Click times are offset by 7 days, so the clicks that count for
             // this session are those with `start <= t <= start + WEEK`.
             let latest = start + WEEK;
-            while hi < ck_to && (*ck.add(hi)).0 <= latest {
-                let c = ((*ck.add(hi)).1 >> 48) as usize;
+            while hi < ck_to && (*ck.add(hi)).time() <= latest {
+                let c = (*ck.add(hi)).campaign();
                 let n = self.cnt.get_unchecked_mut(c);
                 if *n == 0 {
                     *self.act.get_unchecked_mut(c) = session;
@@ -968,8 +907,8 @@ impl<'a> Agg<'a> {
                 *n += 1;
                 hi += 1;
             }
-            while lo < hi && (*ck.add(lo)).0 < start {
-                let c = ((*ck.add(lo)).1 >> 48) as usize;
+            while lo < hi && (*ck.add(lo)).time() < start {
+                let c = (*ck.add(lo)).campaign();
                 let n = self.cnt.get_unchecked_mut(c);
                 *n -= 1;
                 if *n == 0 {
@@ -980,15 +919,15 @@ impl<'a> Agg<'a> {
             }
             let camp = if hi > lo {
                 let mut best = hi - 1;
-                let t = (*ck.add(best)).0;
+                let t = (*ck.add(best)).time();
                 let mut j = best;
-                while j > lo && (*ck.add(j - 1)).0 == t {
+                while j > lo && (*ck.add(j - 1)).time() == t {
                     j -= 1;
-                    if click_before(&*ck.add(j), &*ck.add(best)) {
+                    if (*ck.add(j)).precedes(*ck.add(best)) {
                         best = j;
                     }
                 }
-                ((*ck.add(best)).1 >> 48) as usize
+                (*ck.add(best)).campaign()
             } else {
                 self.organic
             };
@@ -1019,7 +958,7 @@ impl<'a> Agg<'a> {
             .extend_from_slice(&(out.people as u32).to_le_bytes());
         out.people += 1;
         for j in lo..hi {
-            let c = ((*ck.add(j)).1 >> 48) as usize;
+            let c = (*ck.add(j)).campaign();
             if *self.cnt.get_unchecked(c) != 0 {
                 *self.cnt.get_unchecked_mut(c) = 0;
                 let from = *self.act.get_unchecked(c);
@@ -1211,6 +1150,7 @@ fn main() {
     let ctx = Ctx {
         arena: Arena::new(),
         w0,
+        ingest_origin: w0.div_euclid(1000) - (1 << 31),
         wlen,
         links,
         products,
@@ -1256,9 +1196,7 @@ fn main() {
         let blank_cl = ClStage {
             uh: 0,
             name: 0,
-            cp: 0,
-            t: 0,
-            key: 0,
+            click: Click::default(),
         };
         let mut w = Work {
             slab: Slab::new(&ctx.arena),

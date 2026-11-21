@@ -5,3 +5,5 @@ dev/
 out/
 *.md
 .git
+rust/target/
+build/

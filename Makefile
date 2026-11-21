@@ -4,7 +4,7 @@ BIN ?= build/ss
 DEV ?= dev
 ANSWER ?= dev-answer
 
-.PHONY: bin fixtures check-dev fuzz build run-dev
+.PHONY: bin fixtures check-dev fuzz build run-dev rust rust-fixtures
 
 ## Native build (Linux, g++ 11+)
 bin:
@@ -28,3 +28,11 @@ build:
 
 run-dev: build
 	rm -rf out && time scripts/docker_run.sh $(DEV) out
+
+## Rust build (the default Dockerfile builds this)
+rust:
+	mkdir -p build
+	cd rust && cargo build --release && cp target/release/ss ../build/ss-rust
+
+rust-fixtures: rust
+	python3 scripts/run_fixtures.py fixtures -- build/ss-rust

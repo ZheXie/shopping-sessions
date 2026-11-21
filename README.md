@@ -1,22 +1,28 @@
-# Shopping Sessions: C++ pipeline
+# Shopping Sessions: Rust pipeline (and the same in C++)
 
-One static C++17 binary (`src/ss.cpp`, no dependencies) that implements
-`rules.md` exactly and writes both Parquet tables with a small built-in writer.
+One static binary that implements `rules.md` exactly and writes both Parquet
+tables with a small built-in writer. There are two implementations of the same
+design, with identical output:
+
+- `rust/` (std only, no crates): the one the `Dockerfile` builds. About 9%
+  faster than the C++ build.
+- `src/ss.cpp` (C++17, no dependencies): builds with `Dockerfile.cpp`.
 
 ## Results (20M events, warm page cache)
 
-| Setup | Time |
-| --- | --- |
-| Scorer stand-in: 4 cores, no transparent hugepages | ~1.05 s |
-| This machine: 8 cores | ~0.75 s |
+| Setup | Rust | C++ |
+| --- | --- | --- |
+| Scorer stand-in: 4 cores, no transparent hugepages | ~0.95 s | ~1.05 s |
 
 The scorer (8 vCPU = 4 Cascade Lake cores with hyperthreads) is much slower
-than this machine. `taskset -c 0-3 env SS_NOTHP=1 build/ss DATA OUT` reproduced
-the first board score (2.36 s locally, 2.3 s on the board), so it is the local
-stand-in. Under it, the versions so far went 2.36 s -> 1.67 s -> 1.05 s.
+than this machine. `taskset -c 0-3 env SS_NOTHP=1 BIN DATA OUT` reproduced the
+first board score (2.36 s locally, 2.3 s on the board), so it is the local
+stand-in. Under it, the versions so far went 2.36 s -> 1.67 s -> 1.05 s (C++)
+-> 0.95 s (Rust).
 
-At 40M events the run takes about 1.35 s on 8 cores, with a peak of 2.0 GB of
-memory (limit 24 GB). The PySpark starter baseline on the board is 171.91 s.
+At 40M events the Rust run peaks at 2.0 GB of memory (limit 24 GB), and its
+output is identical to the C++ output. The PySpark starter baseline on the
+board is 171.91 s.
 
 ## Correctness checks
 
@@ -75,8 +81,11 @@ little for the exit teardown.
 
 ## Layout
 
-- `src/ss.cpp`: the pipeline.
-- `Dockerfile`: a static build on `debian:bookworm-slim`, run from `scratch`.
+- `rust/`: the Rust pipeline (`src/main.rs` phases; `csv.rs`, `ts.rs`, `ids.rs`,
+  `maps.rs`, `parquet.rs`, `sys.rs` for memory and threads). `cargo test
+  --release` runs the lookup self-check.
+- `Dockerfile`: builds `rust/` on `rust:1.83-slim-bookworm` (static), runs from `scratch`.
+- `src/ss.cpp`, `Dockerfile.cpp`: the C++ version of the same pipeline.
 - `reference/reference.py`, `reference/fuzz.py`: the slow reference and the differential fuzzer.
 - `scripts/`, `fixtures/`, `rules.md`: from the official starter.
 

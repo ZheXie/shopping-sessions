@@ -1,13 +1,11 @@
-# Shopping Sessions: C++ pipeline, one static binary.
-# Build stage compiles with the scorer's CPU baseline (x86-64-v3: AVX2, BMI2;
-# the Cascade Lake scorers support it). The run image holds only the binary.
-FROM debian:bookworm-slim AS build
-RUN apt-get update \
- && apt-get install -y --no-install-recommends g++ libc6-dev \
- && rm -rf /var/lib/apt/lists/*
+# Shopping Sessions: Rust pipeline (rust/), one static binary, no crates.
+# rust/.cargo/config.toml sets the scorer's CPU baseline (x86-64-v3: AVX2,
+# BMI2; the Cascade Lake scorers support it) and static linking.
+# The C++ version of the same pipeline builds with Dockerfile.cpp.
+FROM rust:1.83-slim-bookworm AS build
 WORKDIR /src
-COPY src/ss.cpp .
-RUN g++ -O3 -march=x86-64-v3 -std=c++17 -pthread -static -o /ss ss.cpp
+COPY rust/ .
+RUN cargo build --release && cp target/release/ss /ss
 
 FROM scratch
 COPY --from=build /ss /ss

@@ -9,7 +9,6 @@ RUN cargo build --release && strip -s target/release/shopping-sessions
 FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=builder /src/target/release/shopping-sessions /app/shopping-sessions
-COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh /app/shopping-sessions
 WORKDIR /app
-CMD ["/app/run.sh"]
+# The binary reads DATA_DIR / OUTPUT_DIR / NCPU itself; no shell in between.
+CMD ["/app/shopping-sessions"]

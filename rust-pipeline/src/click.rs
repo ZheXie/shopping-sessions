@@ -17,10 +17,21 @@ impl Click {
     /// the dimension loader checks that campaign indices fit in 16 bits.
     /// `p` has SIMD slack; `source` points to the same ID in the stable CSV.
     #[inline(always)]
-    pub unsafe fn new(time: u64, campaign: u32, p: *const u8, len: usize, source: *const u8) -> Self {
+    pub unsafe fn new(
+        time: u64,
+        campaign: u32,
+        p: *const u8,
+        len: usize,
+        source: *const u8,
+    ) -> Self {
+        debug_assert!(len != 0);
         let id = if len <= 9 && *p.add(len - 1) != 0 {
             let bytes = r8(p);
-            let head = if len < 8 { bytes & (u64::MAX >> (64 - len * 8)) } else { bytes };
+            let head = if len < 8 {
+                bytes & (u64::MAX >> (64 - len * 8))
+            } else {
+                bytes
+            };
             let tail = if len == 9 { *p.add(8) } else { 0 };
             if (head & !ASCII) == 0 && tail < 128 {
                 (_pext_u64(head.swap_bytes(), ASCII) << 7) | tail as u64
@@ -30,7 +41,10 @@ impl Click {
         } else {
             INDIRECT | source as u64
         };
-        Self { time_campaign: (time << 16) | u64::from(campaign), id }
+        Self {
+            time_campaign: (time << 16) | u64::from(campaign),
+            id,
+        }
     }
 
     #[inline(always)]

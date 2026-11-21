@@ -12,6 +12,7 @@
 //!    write Parquet.
 
 mod click;
+mod dense_sessions;
 mod dim;
 mod event_key;
 mod hashx;
@@ -30,6 +31,7 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
 use click::Click;
+use dense_sessions::DenseSessions;
 use dim::SmallTab;
 use hashx::{r4, r8};
 use links::{name_hash, same_name, Edge, Name, Table};
@@ -277,7 +279,7 @@ fn load_dims(data: &Path) -> (SmallTab, SmallTab, u64, Dims) {
         .iter()
         .map(|&i| cat_list[i as usize].clone())
         .collect();
-    let mut products = SmallTab::new(raw_products.len());
+    let mut products = SmallTab::new(raw_products.len(), b"p");
     for &(id, c) in &raw_products {
         products.insert(id, rank[c as usize]);
     }
@@ -296,7 +298,7 @@ fn load_dims(data: &Path) -> (SmallTab, SmallTab, u64, Dims) {
         });
     }
     assert!(camp_names.len() < 60_000, "too many campaigns");
-    let mut campaigns = SmallTab::new(camp_names.len());
+    let mut campaigns = SmallTab::new(camp_names.len(), b"c_");
     for (i, id) in camp_names.iter().enumerate() {
         campaigns.insert(id, i as u32);
     }
@@ -466,8 +468,13 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, source: *const u8,
     let s = w.cl.get_unchecked_mut(w.ncl);
     s.name = links::name_at(up, user_len, source.add(f[1].0 as usize));
     s.link_group = ctx.links.prefetch(name_hash(s.name));
-    s.click = Click::new(rel, camp, base.add(f[0].0 as usize),
-                         (f[0].1 - f[0].0) as usize, source.add(f[0].0 as usize));
+    s.click = Click::new(
+        rel,
+        camp,
+        base.add(f[0].0 as usize),
+        (f[0].1 - f[0].0) as usize,
+        source.add(f[0].0 as usize),
+    );
     w.ncl += 1;
     if w.ncl == BATCH {
         flush_clicks(ctx, w);
@@ -572,6 +579,7 @@ struct Out {
 struct Agg<'a> {
     ctx: &'a Ctx,
     simd_sort: bool,
+    dense: DenseSessions,
     cat_names: &'a [Vec<u8>],
     ndays: usize,
     day0: i32,
@@ -603,6 +611,7 @@ impl<'a> Agg<'a> {
         let ncamp = dims.camp_names.len();
         Agg {
             ctx,
+            dense: DenseSessions::default(),
             simd_sort: std::env::var_os("SS_AVX2").as_deref() != Some(std::ffi::OsStr::new("1"))
                 && is_x86_feature_detected!("avx512f"),
             cat_names: &dims.cat_names,
@@ -763,25 +772,42 @@ impl<'a> Agg<'a> {
         let (mut ev_at, mut ck_at) = (0usize, 0usize);
         for p in 0..people {
             let ev_to = *self.ev_end.get_unchecked(p) as usize;
-            let ck_to = *self.ck_end.get_unchecked(p) as usize;
+            let ck_end = *self.ck_end.get_unchecked(p) as usize;
             let events = &mut self.evs[ev_at..ev_to];
-            let event_shift = PRICE_BITS + self.ctx.cat_bits;
-            if events.len() <= 128 && self.simd_sort {
+            let dense = events.len() >= 256 && self.ctx.wlen < 1 << 33;
+            if dense {
+                self.dense.group(events, self.ctx.wlen, self.ctx.cat_bits);
+            } else if events.len() <= 128 && self.simd_sort {
                 time_sort::small(events);
-            } else if events.len() >= 1024 && self.ctx.wlen < 1 << 33 {
-                time_sort::radix_time(events, &mut self.ev_w, |w| w >> event_shift);
             } else {
                 events.sort_unstable();
             }
+            let ck_to = if dense {
+                ck_at + self.dense.prune_clicks(
+                    &mut self.cks[ck_at..ck_end],
+                    self.organic,
+                    &mut self.ck_raw,
+                )
+            } else {
+                ck_end
+            };
             let clicks = &mut self.cks[ck_at..ck_to];
             if clicks.len() >= 1024 && self.ctx.wlen + WEEK < 1 << 33 {
+                if self.ck_raw.len() < clicks.len() {
+                    self.ck_raw.resize(clicks.len(), Click::default());
+                }
                 time_sort::radix_time(clicks, &mut self.ck_raw, Click::time);
             } else if clicks.len() > 1 {
                 clicks.sort_unstable_by_key(|c| c.time());
             }
-            self.person(*self.names.get_unchecked(p), ev_at, ev_to, ck_at, ck_to);
+            let name = *self.names.get_unchecked(p);
+            if dense {
+                self.person::<true>(name, ev_at, ev_to, ck_at, ck_to);
+            } else {
+                self.person::<false>(name, ev_at, ev_to, ck_at, ck_to);
+            }
             ev_at = ev_to;
-            ck_at = ck_to;
+            ck_at = ck_end;
         }
     }
 
@@ -832,7 +858,7 @@ impl<'a> Agg<'a> {
         o.rows += 1;
     }
 
-    unsafe fn person(
+    unsafe fn person<const DENSE: bool>(
         &mut self,
         name: Name,
         ev_at: usize,
@@ -852,9 +878,18 @@ impl<'a> Agg<'a> {
         let mut cur_day = u32::MAX;
         let (mut row_sessions, mut row_events, mut row_revenue) = (0u32, 0u32, 0u64);
         let mut k = ev_at;
-        while k < ev_to {
-            let mut w = *ev.add(k);
-            let start = w >> shift;
+        loop {
+            let start = if DENSE {
+                let Some(summary) = self.dense.summaries.get(session as usize) else {
+                    break;
+                };
+                summary.start
+            } else {
+                if k == ev_to {
+                    break;
+                }
+                *ev.add(k) >> shift
+            };
             let day = ((start + self.day_off) / DAY) as u32;
             if day != cur_day {
                 if cur_day != u32::MAX {
@@ -869,10 +904,25 @@ impl<'a> Agg<'a> {
             let mut prev = start;
             let mut events = 0u32;
             let mut revenue = 0u64;
-            loop {
+            let end = if DENSE {
+                let summary = self.dense.summaries[session as usize];
+                events = summary.events;
+                ev_at + summary.purchase_end as usize
+            } else {
+                ev_to
+            };
+            while k < end {
+                let w = *ev.add(k);
+                if !DENSE {
+                    let t = w >> shift;
+                    if t - prev > GAP {
+                        break;
+                    }
+                    prev = t;
+                    events += 1;
+                }
                 let price = (w >> cat_bits) & PRICE_MASK;
-                events += 1;
-                if price != 0 {
+                if DENSE || price != 0 {
                     revenue += price;
                     let c = (w & cat_mask) as usize;
                     let sum = self.cat_sum.get_unchecked_mut(c);
@@ -882,15 +932,6 @@ impl<'a> Agg<'a> {
                     *sum += price;
                 }
                 k += 1;
-                if k == ev_to {
-                    break;
-                }
-                w = *ev.add(k);
-                let t = w >> shift;
-                if t - prev > GAP {
-                    break;
-                }
-                prev = t;
             }
 
             // Click times are offset by 7 days, so the clicks that count for
@@ -1163,19 +1204,19 @@ fn main() {
     let chunk = env_usize("SS_CHUNK").unwrap_or(2 << 20).max(4096);
     let sub = env_usize("SS_SUB").unwrap_or(96 << 10).max(64);
     let buffered = std::env::var("SS_READ").as_deref() != Ok("mmap");
-    let mut tasks: Vec<(Buf, usize, usize, Option<&Path>)> = Vec::new();
+    let mut tasks: Vec<(Buf, usize, usize, &Path)> = Vec::new();
     for (path, buf) in &event_files {
         for (a, b) in chunks(buf.len, chunk) {
-            tasks.push((*buf, a, b, Some(path)));
+            tasks.push((*buf, a, b, path));
         }
     }
-    // Clicks come second (`Some(path)` with is_click) and are read like
+    // Clicks come second and are read like
     // events: a pread into a reusable buffer avoids installing, then tearing
     // down, a page-table entry for every page of the click files.
     let n_event_tasks = tasks.len();
     for (path, buf) in &click_files {
         for (a, b) in chunks(buf.len, chunk) {
-            tasks.push((*buf, a, b, Some(path)));
+            tasks.push((*buf, a, b, path));
         }
     }
     let next = AtomicUsize::new(0);
@@ -1214,7 +1255,6 @@ fn main() {
             };
             let is_click = task >= n_event_tasks;
             unsafe {
-                let path = path.unwrap();
                 // Large files: line boundaries are found in the read buffer,
                 // so the mapping is not touched (no faults, no page-table
                 // entries to tear down at exit).

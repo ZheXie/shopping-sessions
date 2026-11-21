@@ -181,6 +181,7 @@ impl Table {
         loop {
             let g = &*self.groups.add(group);
             if name & INLINE != 0 {
+                // All insert workers have joined before immutable lookups begin.
                 let keys = _mm256_load_si256(g.keys.as_ptr().cast());
                 let equal = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(name as i64));
                 let mask = _mm256_movemask_pd(_mm256_castsi256_pd(equal));

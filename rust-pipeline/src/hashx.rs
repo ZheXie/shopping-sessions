@@ -1,4 +1,4 @@
-//! Fast 64-bit hashing of short byte strings (wyhash-style multiply-fold).
+//! Word loads, decimal decoding and hashing for short CSV fields.
 
 const S0: u64 = 0xa076_1d64_78bd_642f;
 const S1: u64 = 0xe703_7ed1_a0b4_28db;
@@ -23,6 +23,18 @@ pub unsafe fn r8(p: *const u8) -> u64 {
 #[inline(always)]
 pub unsafe fn r4(p: *const u8) -> u32 {
     (p as *const u32).read_unaligned()
+}
+
+/// Decode eight digit values packed in little-endian byte lanes (first
+/// digit least significant). Return `u64::MAX` if any lane exceeds nine.
+#[inline(always)]
+pub fn decimal8(lanes: u64) -> u64 {
+    if (lanes.wrapping_add(0x7676_7676_7676_7676) | lanes) & 0x8080_8080_8080_8080 != 0 {
+        return u64::MAX;
+    }
+    let pairs = lanes.wrapping_mul(2561) >> 8;
+    let quads = (pairs & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
+    (quads & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
 }
 
 /// Two words that, with `len`, determine the whole string (after folding the

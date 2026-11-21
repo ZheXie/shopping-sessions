@@ -1,6 +1,6 @@
 //! Timestamps: F1 `2026-10-03T23:58:10Z`, F2 `...+HH:MM`, F3 epoch millis.
 
-use crate::hashx::r8;
+use crate::hashx::{decimal8, r8};
 use std::arch::x86_64::*;
 
 pub const BAD: i64 = i64::MIN;
@@ -18,7 +18,7 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 const SLOTS: usize = 128;
 
-/// Memo of `YYYY-MM-DD` text to the UTC ms of that midnight. A dataset only
+/// Memo of `YYYY-MM-DD` text to the UTC epoch seconds of that midnight. A dataset only
 /// holds a few dozen dates, so the calendar arithmetic runs once per date.
 pub struct Dates {
     head: [u64; SLOTS],
@@ -180,18 +180,6 @@ unsafe fn thirteen(p: *const u8) -> i64 {
     leading * 100_000_000 + trailing
 }
 
-/// Eight ASCII digits at `p`, or `u64::MAX`.
-#[inline(always)]
-unsafe fn eight(p: *const u8) -> u64 {
-    let x = r8(p) ^ 0x3030_3030_3030_3030;
-    if (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 != 0 {
-        return u64::MAX;
-    }
-    let x = x.wrapping_mul(2561) >> 8;
-    let x = (x & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
-    (x & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
-}
-
 #[inline(always)]
 unsafe fn digits(p: *const u8, len: usize) -> i64 {
     if len == 0 {
@@ -211,7 +199,7 @@ unsafe fn digits(p: *const u8, len: usize) -> i64 {
     if len - i >= 8 {
         end = len - 8;
         scale = 100_000_000;
-        v = eight(p.add(end));
+        v = decimal8(r8(p.add(end)) ^ 0x3030_3030_3030_3030);
         if v == u64::MAX {
             return BAD;
         }

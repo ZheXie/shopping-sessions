@@ -48,11 +48,6 @@ pub fn map_file(path: &Path) -> Buf {
         };
     }
     unsafe {
-        let pop = if std::env::var("SS_POP").is_ok() {
-            libc::MAP_POPULATE
-        } else {
-            0
-        };
         // Reserve one zero page past the file so the slack is always readable.
         let span = ((len + PAGE - 1) & !(PAGE - 1)) + PAGE;
         let base = libc::mmap(
@@ -70,7 +65,7 @@ pub fn map_file(path: &Path) -> Buf {
                 base,
                 len,
                 libc::PROT_READ,
-                libc::MAP_PRIVATE | libc::MAP_FIXED | pop,
+                libc::MAP_PRIVATE | libc::MAP_FIXED,
                 f.as_raw_fd(),
                 0,
             )

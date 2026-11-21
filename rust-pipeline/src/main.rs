@@ -182,6 +182,7 @@ struct Work<'a> {
     nev: usize,
     cl: [ClStage; BATCH],
     ncl: usize,
+    dates: ts::Dates,
 }
 
 fn env_path(key: &str, default: &str) -> PathBuf {
@@ -423,12 +424,16 @@ unsafe fn event_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 7
     if b0 == e0 {
         return;
     }
-    let ingest = ts::parse(base.add(f[3].0 as usize), (f[3].1 - f[3].0) as usize);
+    let ingest = w
+        .dates
+        .parse(base.add(f[3].0 as usize), (f[3].1 - f[3].0) as usize);
     if ingest == ts::BAD {
         return;
     }
     let (eh, eh2) = hash2(base.add(b0 as usize), (e0 - b0) as usize);
-    let t = ts::parse(base.add(f[2].0 as usize), (f[2].1 - f[2].0) as usize);
+    let t = w
+        .dates
+        .parse(base.add(f[2].0 as usize), (f[2].1 - f[2].0) as usize);
     let rel = t.wrapping_sub(ctx.w0) as u64;
     let user_len = (f[1].1 - f[1].0) as usize;
     let mut valid = (user_len != 0)
@@ -509,7 +514,9 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 4
     if f[0].0 == f[0].1 || user_len == 0 {
         return;
     }
-    let t = ts::parse(base.add(f[3].0 as usize), (f[3].1 - f[3].0) as usize);
+    let t = w
+        .dates
+        .parse(base.add(f[3].0 as usize), (f[3].1 - f[3].0) as usize);
     let rel = t.wrapping_sub(ctx.w0 - WEEK as i64) as u64;
     if rel >= ctx.wlen + WEEK {
         return;
@@ -553,6 +560,17 @@ unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
     w.ncl = 0;
 }
 
+/// Blocks of a partition are scattered, so the hardware prefetcher loses the
+/// trail at the end of each one.
+#[inline(always)]
+unsafe fn prefetch_block(blk: Option<&Blk>) {
+    if let Some(blk) = blk {
+        for line in 0..4 {
+            _mm_prefetch((blk.ptr + line * 64) as *const i8, _MM_HINT_T0);
+        }
+    }
+}
+
 /// Marks every copy of an event but the one with the smallest `ingest_ts`.
 unsafe fn dedup_partition(arena: &Arena, blocks: &[Blk], table: &mut Vec<u64>) {
     let n: usize = blocks.iter().map(|b| b.n as usize).sum();
@@ -570,7 +588,8 @@ unsafe fn dedup_partition(arena: &Arena, blocks: &[Blk], table: &mut Vec<u64>) {
             (*((arena.base + at * Arena::UNIT) as *mut Pay)).n1 |= DEAD;
         }
     };
-    for blk in blocks {
+    for (b, blk) in blocks.iter().enumerate() {
+        prefetch_block(blocks.get(b + 1));
         let base = blk.ptr as *const Key;
         for i in 0..blk.n as usize {
             let k = base.add(i);
@@ -701,7 +720,8 @@ impl<'a> Agg<'a> {
         self.ev_end.clear();
         self.ev_idx.clear();
         self.ev_w.clear();
-        for blk in pays {
+        for (b, blk) in pays.iter().enumerate() {
+            prefetch_block(pays.get(b + 1));
             let base = blk.ptr as *const Pay;
             for i in 0..blk.n as usize {
                 let p = *base.add(i);
@@ -737,7 +757,8 @@ impl<'a> Agg<'a> {
         self.ck_end.resize(people, 0);
         self.ck_idx.clear();
         self.ck_raw.clear();
-        for blk in clks {
+        for (b, blk) in clks.iter().enumerate() {
+            prefetch_block(clks.get(b + 1));
             let base = blk.ptr as *const Clk;
             for i in 0..blk.n as usize {
                 let c = *base.add(i);
@@ -1185,8 +1206,6 @@ fn main() {
             tasks.push((buf, a, b, false));
         }
     }
-    let mode = env_usize("SS_MODE").unwrap_or(0);
-    let populate = env_usize("SS_POPULATE").unwrap_or(1) != 0;
     let next = AtomicUsize::new(0);
     let scattered = par_map(threads, |_| {
         let mut sc = Scan::new();
@@ -1217,50 +1236,14 @@ fn main() {
             nev: 0,
             cl: [blank_cl; BATCH],
             ncl: 0,
+            dates: ts::Dates::new(),
         };
         loop {
             let Some(&(buf, a, b, is_events)) = tasks.get(next.fetch_add(1, Relaxed)) else {
                 break;
             };
-            if populate {
-                sys::populate(unsafe { buf.ptr.add(a) }, b - a);
-            }
+            sys::populate(unsafe { buf.ptr.add(a) }, b - a);
             unsafe {
-                if mode == 1 {
-                    let mut pos = scan::line_start(buf.ptr, buf.len, a);
-                    while pos < b {
-                        pos = sc.scan(buf.ptr, buf.len, pos, (pos + sub).min(b));
-                    }
-                    continue;
-                }
-                if mode == 2 {
-                    let mut x = 0u64;
-                    if is_events {
-                        for_rows::<7, _>(&mut sc, buf, a, b, sub, |_, f| x += f[0].0 as u64);
-                    } else {
-                        for_rows::<4, _>(&mut sc, buf, a, b, sub, |_, f| x += f[0].0 as u64);
-                    }
-                    std::hint::black_box(x);
-                    continue;
-                }
-                if mode == 3 {
-                    if is_events {
-                        for_rows::<7, _>(&mut sc, buf, a, b, sub, |base, f| {
-                            event_row(&ctx, &mut w, base, f);
-                            if w.nev == BATCH - 1 {
-                                w.nev = 0;
-                            }
-                        });
-                    } else {
-                        for_rows::<4, _>(&mut sc, buf, a, b, sub, |base, f| {
-                            click_row(&ctx, &mut w, base, f);
-                            if w.ncl == BATCH - 1 {
-                                w.ncl = 0;
-                            }
-                        });
-                    }
-                    continue;
-                }
                 if is_events {
                     for_rows::<7, _>(&mut sc, buf, a, b, sub, |base, f| {
                         event_row(&ctx, &mut w, base, f)
@@ -1311,15 +1294,8 @@ fn main() {
             }
             unsafe { agg.partition(&pays[part], &clks[part]) };
         }
-        let t_parts = started.elapsed().as_secs_f64() * 1e3;
-        if (agg.out.rows > 0 || t == 0) && std::env::var("SS_NOWRITE").is_err() {
+        if agg.out.rows > 0 || t == 0 {
             write_user_file(&user_dir, t, &agg.out);
-        }
-        if timing {
-            eprintln!(
-                "  thread {t}: partitions done at {t_parts:.1} ms, file at {:.1} ms",
-                started.elapsed().as_secs_f64() * 1e3
-            );
         }
         (agg.out.rows, std::mem::take(&mut agg.out.camp))
     });
@@ -1345,36 +1321,6 @@ fn main() {
             "total",
             started.elapsed().as_secs_f64() * 1e3
         );
-        if std::env::var("SS_SMAPS").is_ok() {
-            if let Ok(maps) = fs::read_to_string("/proc/self/smaps") {
-                let mut head = String::new();
-                let (mut size, mut rss) = (0u64, 0u64);
-                for line in maps.lines() {
-                    let num = || {
-                        line.split_whitespace()
-                            .nth(1)
-                            .and_then(|v| v.parse::<u64>().ok())
-                            .unwrap_or(0)
-                    };
-                    if line.starts_with("Size:") {
-                        size = num();
-                    } else if line.starts_with("Rss:") {
-                        rss = num();
-                    } else if line.starts_with("AnonHugePages:") {
-                        if rss > 16000 && !head.contains(".csv") {
-                            eprintln!("  {head} size={size}k rss={rss}k thp={}k", num());
-                        }
-                    } else if line
-                        .split_whitespace()
-                        .nth(1)
-                        .map(|t| t.len() == 4 && t.ends_with('p'))
-                        .unwrap_or(false)
-                    {
-                        head = line.to_string();
-                    }
-                }
-            }
-        }
         if let Ok(roll) = fs::read_to_string("/proc/self/smaps_rollup") {
             for line in roll.lines().filter(|l| {
                 l.starts_with("Rss") || l.starts_with("AnonHuge") || l.starts_with("Anonymous")

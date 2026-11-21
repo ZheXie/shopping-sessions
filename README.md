@@ -8,8 +8,41 @@ Exact ETL for dirty click-stream logs → two daily Parquet tables. Fastest corr
 
 ## Performance and validation
 
-The scored entry is the Rust binary built by the root Dockerfile. These local
-medians compare the optimized entry to upstream commit `ad075c9`.
+The root Dockerfile builds the Rust entry with profile-guided optimization.
+The following medians compare the same generated inputs and count elapsed time
+from launch through exit, including writing both tables.
+
+| Generated events + clicks | Seed | Process `d24a0b7` | Process `478c814` | Process candidate | OCI `d24a0b7` | OCI candidate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 20M + 5M | 89017 | 306.1 ms | 268.7 ms | **234.2 ms** | 379.3 ms | **317.2 ms** |
+| 60M + 15M | 53197 | 1006.5 ms | 913.3 ms | **758.5 ms** | 1077.0 ms | **831.9 ms** |
+
+Measurements used Ryzen 7 7800X3D, WSL2, rustc 1.100.0 and eight workers.
+All three executables used the repository's PGO build and were stripped.
+Each binary was warmed once, then run nine times in rotating order with a
+fresh output directory. The OCI pair ran seven times each in alternating
+order, with warm input pages, rootless `runc`, a read-only root and input,
+a private network namespace and host runtime libraries. The Docker daemon
+was inaccessible to this user. The competition specifies eight pinned
+vCPUs and 24 GB RAM. Its hidden input, CPU model and cache state may differ.
+
+On the 20M seed, restricting eight workers to four local cores and forcing
+AVX2 gave 529.6 → 439.3 ms. Additionally disabling transparent huge pages
+for each process gave 816.0 → 725.6 ms. Both are seven-run medians.
+On the 60M seed, peak RSS fell from 3.83 to 2.95 GiB and total Parquet
+output from 181.93 to 129.27 MB.
+
+The candidate passed all 36 fixtures in three modes (automatic dispatch,
+forced AVX2, and one worker with AVX2), the official 1M answer, nine Rust
+unit tests, the regression script and 120 randomized cases against the
+Python reference. Both large inputs matched `d24a0b7` in every column with
+zero duplicate keys. Seed 53197 produced 6,584,966 user rows and 28,014
+campaign rows. A separate reference comparison exercised dense users with
+more than 6,000 clicks each, including tied IDs and attribution boundaries.
+
+### Previous measurements at `d24a0b7`
+
+The following historical medians compare `d24a0b7` to `ad075c9`.
 
 | Generated input | Seed | Binary, original → optimized | Rootless OCI, original → optimized |
 | --- | ---: | ---: | ---: |
@@ -39,8 +72,8 @@ daemon was unavailable on this host. Official hidden-set timing is pending.
 
 ### Memory traffic round (after `d24a0b7`)
 
-The scorer is 8 vCPUs on 4 Cascade Lake cores, so these timings pin the run to
-four cores (`taskset -c 0-3`, 8 workers). Each figure is the minimum and median
+These earlier measurements used four local cores and eight workers as a
+limited-core proxy (`taskset -c 0-3`). Each figure is the minimum and median
 of 9 alternating runs on 20M events + 5M clicks (seed 11), with the PGO build.
 
 | Setup | `d24a0b7` | This round |
@@ -107,11 +140,12 @@ the entire child process. To build a baseline and reproduce a practice run:
 
 ```sh
 scratch=$(mktemp -d)
-git archive ad075c9 rust-pipeline | tar -x -C "$scratch"
-(cd "$scratch/rust-pipeline" && cargo build --release --locked)
+git archive d24a0b7 rust-pipeline scripts/build_pgo.sh third_party/generator | tar -x -C "$scratch"
+sh "$scratch/scripts/build_pgo.sh"
+make build-local-pgo
 cargo build --release --locked --manifest-path third_party/generator/Cargo.toml
-third_party/generator/target/release/generate --seed 714 --events 20000000 --clicks 5000000 --output "$scratch/practice"
-python3 scripts/benchmark.py "$scratch/practice" "$scratch/rust-pipeline/target/release/shopping-sessions" rust-pipeline/target/release/shopping-sessions --runs 7
+third_party/generator/target/release/generate --seed 89017 --events 20000000 --clicks 5000000 --output "$scratch/practice"
+python3 scripts/benchmark.py "$scratch/practice" "$scratch/rust-pipeline/target/release/shopping-sessions" rust-pipeline/target/release/shopping-sessions --runs 9
 ```
 
 ## Implementation
@@ -120,17 +154,27 @@ python3 scripts/benchmark.py "$scratch/practice" "$scratch/rust-pipeline/target/
   A read-only mapping provides stable addresses for IDs needed after parsing.
   SIMD builds an index of delimiters and wrapping quotes while checking the
   contest dialect. AVX-512 byte compression is selected on capable CPUs.
-- Linked IDs use a compact concurrent union-find. Common short IDs have a
-  reversible one-word representation. Other IDs compare by their full bytes.
+- Each aligned cache line in the linked-ID table stores four keys and their
+  canonical names. AVX2 checks all four inline keys at once, and an overflow
+  bit records whether a lookup may need to continue in the next group.
+- A click stores its campaign, time and tie-break ID in 16 bytes. Common ASCII
+  IDs preserve byte order in a 63-bit key. Other IDs refer to the original
+  bytes so a timestamp tie always uses the exact ID. Canonical decimal product
+  and campaign IDs use compact direct tables with an exact string fallback.
 - Parsing scatters 16-byte event keys and 16-byte payloads. Dedup keeps the
   earliest ingest even when the winning event fails validation. Only purchases
   look up a product category.
 - Larger person partitions start first. Small groups can use SIMD sorting
-  networks, and large groups use a time radix sort when their timestamp range
-  permits it. Sessionization and the seven-day attribution window run per person.
+  networks. For dense users, each 1,048,576 ms bin fits inside the 30-minute
+  session gap. The bin's first and last event decide whether adjacent occupied
+  bins join. Only purchases need individual category aggregation. Clicks with
+  the same campaign and first eligible session can retain the latest click,
+  breaking equal times by ID. That click covers every later session the others
+  could still assist.
 - Each worker writes its own Parquet file. A dictionary stores each person ID
   once per worker, and run-length encoding covers consecutive daily rows.
-  Campaign totals use a final reduction.
+  Byte and 16-bit dictionary indices also compact the day, session and event
+  columns. Campaign totals use a final reduction.
 
 The runtime takes `DATA_DIR`, `OUTPUT_DIR` and `NCPU`. Set `SS_TIMING=1` for
 stage diagnostics, `SS_AVX2=1` to exercise the AVX2 fallback, or `SS_READ=mmap`

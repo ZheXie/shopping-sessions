@@ -2,4 +2,4 @@
 
 Name:
 Members:
-Engine: Python correctness baseline (custom CSV) → Rust speed (planned)
+Engine: Rust (mimalloc + rayon + mmap); Python reference in pipeline/

@@ -1,5 +1,12 @@
 fixtures/
 dev/
 out/
+scratch/
 *.md
 .git
+dev-answer/
+third_party/
+pipeline/
+scripts/
+target/
+rust-pipeline/target/

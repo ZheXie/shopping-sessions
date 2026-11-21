@@ -8,55 +8,44 @@ Exact ETL for dirty click-stream logs → two daily Parquet tables. Fastest corr
 
 ## Status
 
-**Correctness baseline is green:**
-- 36/36 fixtures pass
-- `make check-dev` / seed-1 1M-event set: **exact MATCH** (~23s in this environment, pure Python parse)
+Rust pipeline is the scored entry (`Dockerfile` → `/app/shopping-sessions`).
 
-Next: speed (Rust / parallel parse) toward sub-2s practice times. See `IMPLEMENTATION_PLAN.md`.
+| Check | Result |
+| --- | --- |
+| 36 fixtures | pass |
+| seed-1 1M `check-dev` | exact MATCH · ~1.0–1.1 s (8 threads, warm) |
+| ~20M local | ~25 s (8 threads) |
+
+Python reference remains in `pipeline/pipeline.py` (correct but slow).
 
 ## Quick start
 
 ```sh
-# Python for local fixture runs
-pip install -r requirements.txt
+# Local binary
+make build-local
+make fixtures          # 36/36
+make dev               # needs `generate` on PATH (see third_party/generator)
+make run-dev && make check-dev
 
-# All 36 edge-case fixtures (no Docker)
-python3 scripts/run_fixtures.py fixtures -- python3 pipeline/pipeline.py
-
-# Dev set (needs `generate` from third_party/generator)
-cd third_party/generator && cargo build --release
-export PATH="$PWD/target/release:$PATH"
-cd ../..
-make dev                 # 1M events, seed 1
-DATA_DIR=dev OUTPUT_DIR=out SCRATCH_DIR=scratch python3 pipeline/pipeline.py
-make check-dev           # vs ./dev-answer
+# Scorer-shaped image
+make build
+make fixtures-docker
 ```
 
-With Docker (scorer-shaped run):
+## Architecture (speed path)
+
+1. mmap + custom CSV dialect (rules.md exact)
+2. Parallel per-file event/click parse → merge dedup
+3. Union-Find linked IDs → sessionize (30 min gap) → asof attribution + assists
+4. Aggregate → Snappy Parquet (`day` = Date32)
+
+Env: `DATA_DIR` / `OUTPUT_DIR` / `SCRATCH_DIR` / `NCPU`. Optional `SS_TIMING=1` for stage logs.
+
+## Submit
+
+Public GitHub repo with root `Dockerfile`, e.g. https://github.com/ZheXie/shopping-sessions  
+Sync from Origin:
 
 ```sh
-make build
-make fixtures
-make run-dev && make check-dev
+cd ~/shiaoping && git pull origin main && git push github main
 ```
-
-## Layout
-
-| Path | Purpose |
-| --- | --- |
-| `pipeline/pipeline.py` | Entry point the container runs |
-| `fixtures/` | 36 hand-written edge cases |
-| `dev-answer/` | Expected tables for seed-1 1M-event set |
-| `third_party/generator/` | Rust data generator |
-| `Dockerfile` / `run.sh` | Scorer image + entry |
-
-## Strategy (short)
-
-1. **Custom CSV lexer** — do not trust Polars/DuckDB CSV for this dialect  
-2. Pass all 36 fixtures, then `make check-dev`  
-3. Port hot path to **Rust** for sub-2s practice times (board leaders ~1.2–2s)  
-4. Submit public repo + amd64 Dockerfile; keep practice ≪ 60s for the 3-minute final cap
-
-## Limits (scorer)
-
-8 vCPU · 24 GB · no network · `DATA_DIR` / `OUTPUT_DIR` / `SCRATCH_DIR` · uid 1000 · read-only root except `/tmp` and mounts

@@ -1,32 +1,40 @@
 IMAGE ?= shopping-sessions:latest
 CPUS  ?= 8
 MEM   ?= 24g
-# The scorer's platform. PLATFORM=linux/arm64 builds and runs natively on an Apple-silicon Mac, for fast local loops.
 PLATFORM ?= linux/amd64
 DEV   ?= dev
-# In the monorepo the fixtures live two levels up; the published starter has its own copy.
 FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
+BIN ?= rust-pipeline/target/release/shopping-sessions
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build fixtures dev run-dev check-dev
+.PHONY: build build-local fixtures dev run-dev check-dev
 
-## Build the image for the scorer's platform, linux/amd64 (emulated on Apple silicon)
+## Build the scorer image (linux/amd64)
 build:
 	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) .
 
-## Run the image on all 36 edge-case fixtures and diff against the expected tables
-fixtures: build
-	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh
+## Native release binary for local loops
+build-local:
+	cd rust-pipeline && RUSTFLAGS="-C target-cpu=native" cargo build --release
 
-## Make the 1M-event dev set with the published generator (needs `generate` on PATH)
+## Run all 36 fixtures against the local binary
+fixtures: build-local
+	python3 scripts/run_fixtures.py $(FIXTURES) -- $(BIN)
+
+## Generate the 1M-event dev set
 dev:
 	generate --seed 1 --events 1000000 --clicks 250000 --output $(DEV)
 
-## Run on the dev set with scorer flags and time it
-run-dev: build
-	rm -rf out && time scripts/docker_run.sh $(DEV) out
+## Timed run on the local binary
+run-dev: build-local
+	rm -rf out && mkdir -p out scratch
+	NCPU=$(CPUS) DATA_DIR=$(DEV) OUTPUT_DIR=out SCRATCH_DIR=scratch time $(BIN)
 
-## Compare your dev output with the published dev answer (dev-answer.zip, unzipped): make check-dev ANSWER=dev-answer
+## Exact diff against published dev-answer
 ANSWER ?= dev-answer
 check-dev:
-	python3 scripts/compare.py out $(ANSWER)
+	PYTHONPATH=scripts python3 scripts/compare.py out $(ANSWER)
+
+## Docker run on fixtures (scorer-shaped)
+fixtures-docker: build
+	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh

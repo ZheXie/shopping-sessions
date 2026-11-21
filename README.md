@@ -82,5 +82,5 @@ little for the exit teardown.
 
 Test hooks (never set by the scorer): `SS_CHUNK` (task size in bytes),
 `SS_RBUF` (read buffer bytes), `SS_NOTHP` (no hugepage advice),
-`SS_NOFREE` (keep pages until exit), `SS_PREFAULT`, `SS_DEBUG` (memory
-stats). Phase timings go to stderr.
+`SS_NOFREE` (keep pages until exit), `SS_DEBUG` (memory stats). Phase
+timings go to stderr.

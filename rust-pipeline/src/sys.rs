@@ -245,6 +245,22 @@ impl Arena {
         RECYCLE_NEXT.store(self.base + HUGE, std::sync::atomic::Ordering::Release);
     }
 
+    /// Discard one disjoint part of the record mapping in parallel at shutdown.
+    /// The caller must finish all reads and writes to the arena first.
+    pub unsafe fn discard_range(&self, index: usize, threads: usize) {
+        const HP: usize = 2 << 20;
+        let pages = self.next.load(Relaxed).div_ceil(HP);
+        let from = pages * index / threads * HP;
+        let to = pages * (index + 1) / threads * HP;
+        if to > from {
+            libc::madvise(
+                (self.base + from) as *mut libc::c_void,
+                to - from,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+
     fn chunk(&self, bytes: usize) -> usize {
         let at = self.next.fetch_add(bytes, Relaxed);
         assert!(at + bytes <= self.size, "record arena exhausted");

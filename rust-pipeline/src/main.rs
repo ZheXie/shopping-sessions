@@ -1434,6 +1434,7 @@ fn main() {
     let live_events: usize = pays.iter().flatten().map(|b| b.n as usize).sum();
     let rows_hint = live_events / 4 / threads + 4096;
     let next = AtomicUsize::new(0);
+    let processed = std::sync::Barrier::new(threads);
     let outs = par_map(threads, |t| {
         let mut agg = std::mem::ManuallyDrop::new(Agg::new(&ctx, &dims, w0, w1, rows_hint));
         loop {
@@ -1442,6 +1443,10 @@ fn main() {
             };
             unsafe { agg.partition(&pays[part], &clks[part]) };
         }
+        // Every Pay and Clk has been consumed. Parquet columns and
+        // campaign totals own their data independently of the record arena.
+        processed.wait();
+        unsafe { ctx.arena.discard_range(t, threads) };
         if agg.out.rows > 0 || t == 0 {
             write_user_file(&user_dir, t, &agg.out, agg.day0, agg.ndays);
         }

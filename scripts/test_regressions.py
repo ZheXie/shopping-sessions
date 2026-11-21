@@ -139,8 +139,18 @@ def main():
         root = Path(tmp)
         data = root / "data"
         expected = make_input(data)
-        for mode, threads in (("pread", 1), ("pread", 4), ("mmap", 4)):
-            out = root / f"out-{mode}-{threads}"
+        products = data / "products.csv"
+        initial_products = products.read_bytes()
+        cases = [
+            ("pread", 1, []), ("pread", 4, []), ("mmap", 4, []),
+            ("pread", 1, [(f"extra{i}", f"category{i}") for i in range(257)]),
+            ("pread", 1, [("extra", "c" * 65536)]),
+        ]
+        for case, (mode, threads, extra_categories) in enumerate(cases):
+            # Both catalog fallbacks must preserve every observed category,
+            # including its UTF-8 bytes and the nulls on non-purchasing days.
+            products.write_bytes(initial_products + csv_bytes(extra_categories))
+            out = root / f"out-{case}"
             env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(out),
                        NCPU=str(threads), SS_CHUNK="4096", SS_SUB="64", SS_READ=mode)
             subprocess.run([str(binary)], env=env, check=True)
@@ -148,7 +158,7 @@ def main():
                 actual = sorted(load_actual(out / table, schema).rows())
                 if actual != sorted(expected[table]):
                     raise AssertionError(f"{mode}/{threads} {table}: expected {sorted(expected[table])!r}, got {actual!r}")
-            print(f"PASS {mode} / {threads} worker(s)")
+            print(f"PASS {mode} / {threads} worker(s) / {len(extra_categories)} extra categories")
 
 
 if __name__ == "__main__":

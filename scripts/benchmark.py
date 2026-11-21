@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Interleave two binaries on the same input; measure process start through exit."""
 import argparse
+import ctypes
 import os
 from pathlib import Path
 import statistics
@@ -16,9 +17,17 @@ def main():
     parser.add_argument("candidate", type=Path)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--cpus", type=int, default=8)
+    parser.add_argument("--disable-thp", action="store_true",
+                        help="disable transparent huge pages for the benchmark and both children on Linux")
     args = parser.parse_args()
     if min(args.runs, args.cpus) < 1:
         parser.error("--runs and --cpus must be positive")
+
+    if args.disable_thp:
+        libc = ctypes.CDLL(None, use_errno=True)
+        # PR_SET_THP_DISABLE is inherited across fork and exec.
+        if libc.prctl(41, 1, 0, 0, 0) != 0:
+            parser.error(f"could not disable THP: {os.strerror(ctypes.get_errno())}")
 
     binaries = [p.resolve(strict=True) for p in (args.baseline, args.candidate)]
     results = [[], []]

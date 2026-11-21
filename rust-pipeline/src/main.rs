@@ -625,8 +625,9 @@ struct Out {
     wide_day: Vec<i32>,
     sessions: Vec<u8>,
     events: Counts,
-    revenue: Vec<i64>,
+    revenue: pq::SparseRevenue,
     top_def: Vec<u8>,
+    indexed_top: bool,
     top: Vec<u8>,
     rows: usize,
     /// `[sessions, purchasing_sessions, revenue_cents, assisted_sessions]`
@@ -692,7 +693,9 @@ impl<'a> Agg<'a> {
                 wide_day: Vec::new(),
                 sessions: Vec::with_capacity(rows_hint),
                 events: Counts::new(rows_hint),
-                revenue: Vec::with_capacity(rows_hint),
+                revenue: pq::SparseRevenue::new(rows_hint),
+                indexed_top: dims.cat_names.len() <= 256
+                    && dims.cat_names.iter().map(|name| name.len() + 4).sum::<usize>() <= 64 << 10,
                 top_def: Vec::with_capacity(rows_hint / 8 + 1),
                 top: Vec::with_capacity(rows_hint * 4),
                 rows: 0,
@@ -974,7 +977,7 @@ impl<'a> Agg<'a> {
         // crossing midnight. No UTC day can hold more than 48 starts per person.
         o.sessions.push(sessions as u8);
         o.events.push(events);
-        o.revenue.push(revenue as i64);
+        o.revenue.push(o.rows, revenue);
         if o.rows & 7 == 0 {
             o.top_def.push(0);
         }
@@ -988,9 +991,13 @@ impl<'a> Agg<'a> {
                 }
             }
             self.touched.clear();
-            let cat = self.cat_names.get_unchecked(best as usize);
-            o.top.extend_from_slice(&(cat.len() as u32).to_le_bytes());
-            o.top.extend_from_slice(cat);
+            if o.indexed_top {
+                o.top.push(best as u8);
+            } else {
+                let cat = self.cat_names.get_unchecked(best as usize);
+                o.top.extend_from_slice(&(cat.len() as u32).to_le_bytes());
+                o.top.extend_from_slice(cat);
+            }
             *o.top_def.last_mut().unwrap_unchecked() |= 1 << (o.rows & 7);
         }
         o.rows += 1;
@@ -1145,19 +1152,13 @@ impl<'a> Agg<'a> {
     }
 }
 
-fn write_user_file(dir: &Path, index: usize, o: &Out, day0: i32, ndays: usize) {
+fn write_user_file(dir: &Path, index: usize, o: &Out, day0: i32, ndays: usize, categories: &[Vec<u8>]) {
     // A byte-aligned dictionary bit-pack run directly consumes the compact
     // in-memory indices. The Parquet hybrid encoding pads the last group to 8.
     let groups = o.rows.div_ceil(8);
     let missing = groups * 8 - o.rows;
     let pad = &[0u8; 7][..missing];
-    let mut run = ((groups as u64) << 1) | 1;
-    let mut header = vec![8];
-    while run >= 128 {
-        header.push((run as u8) | 128);
-        run >>= 7;
-    }
-    header.push(run as u8);
+    let header = pq::packed_header(8, o.rows);
     let session_values: [i32; 49] = std::array::from_fn(|n| n as i32);
     let days = if ndays <= 256 {
         (0..ndays).map(|n| day0 + n as i32).collect::<Vec<_>>()
@@ -1199,6 +1200,25 @@ fn write_user_file(dir: &Path, index: usize, o: &Out, day0: i32, ndays: usize) {
             ],
         }
     };
+    let (revenue_header, payload) = o.revenue.parts(o.rows);
+    let mut categories_page = Vec::new();
+    let top_header;
+    let top = if o.indexed_top && !o.top.is_empty() {
+        for name in categories {
+            categories_page.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            categories_page.extend_from_slice(name);
+        }
+        let groups = o.top.len().div_ceil(8);
+        top_header = pq::packed_header(8, o.top.len());
+        let padding = &[0u8; 7][..groups * 8 - o.top.len()];
+        Col {
+            name: "top_category",
+            kind: Kind::OptDictStr(categories.len()),
+            parts: vec![&categories_page, &o.top_def, &top_header, &o.top, padding],
+        }
+    } else {
+        Col { name: "top_category", kind: Kind::OptStr, parts: vec![&o.top_def, &o.top] }
+    };
     let cols = [
         Col {
             name: "user_id",
@@ -1214,14 +1234,10 @@ fn write_user_file(dir: &Path, index: usize, o: &Out, day0: i32, ndays: usize) {
         counts,
         Col {
             name: "revenue_cents",
-            kind: Kind::I64,
-            parts: vec![bytes_of(&o.revenue)],
+            kind: Kind::SnappyI64,
+            parts: vec![&revenue_header, payload],
         },
-        Col {
-            name: "top_category",
-            kind: Kind::OptStr,
-            parts: vec![&o.top_def, &o.top],
-        },
+        top,
     ];
     pq::write_file(&dir.join(format!("part-{index}.parquet")), o.rows, &cols);
 }
@@ -1549,7 +1565,9 @@ fn main() {
         processed.wait();
         unsafe { ctx.arena.discard_range(t, threads) };
         if agg.out.rows > 0 || t == 0 {
-            write_user_file(&user_dir, t, &agg.out, agg.day0, agg.ndays);
+            let rows = agg.out.rows;
+            agg.out.revenue.finish(rows);
+            write_user_file(&user_dir, t, &agg.out, agg.day0, agg.ndays, agg.cat_names);
         }
         (agg.out.rows, std::mem::take(&mut agg.out.camp))
     });
@@ -1584,7 +1602,7 @@ fn main() {
         }
     }
     eprintln!("wrote user_daily={user_rows} campaign_daily={camp_rows} threads={threads}");
-    // Everything still mapped is reclaimed faster by the kernel than by us.
+    // All output files are closed. The kernel reclaims the remaining mappings at exit.
     std::process::exit(0);
 }
 

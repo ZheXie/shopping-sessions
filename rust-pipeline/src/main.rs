@@ -26,10 +26,10 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::time::Instant;
 
 use hashx::{hash, hash2, r4, r8};
-use links::{id_bytes, Edge, Table};
+use links::{id_bytes, name_hash, same_name, Edge, Name, Table, ADDR, LONG};
 use pq::{bytes_of, Col, Kind};
 use scan::Scan;
-use sys::{par_map, Blk, Buf, PartWriter, Slab};
+use sys::{par_map, Arena, Blk, Buf, PartWriter, Slab};
 
 const DAY: u64 = 86_400_000;
 const WEEK: u64 = 7 * DAY;
@@ -37,32 +37,34 @@ const GAP: u64 = 1_800_000;
 const MAX_PRICE: u64 = 10_000_000;
 const PRICE_BITS: u32 = 24;
 const PRICE_MASK: u64 = (1 << PRICE_BITS) - 1;
-const PTR_MASK: u64 = (1 << 48) - 1;
 const DEAD: u64 = 1 << 63;
+/// Bits of `Key::x` holding `ingest_ts`, in ms from 2^32 ms before the window.
+const INGEST_BITS: u32 = 33;
+const INGEST_MASK: u64 = (1 << INGEST_BITS) - 1;
 const PART_SHIFT: u32 = 44;
 const MAX_PARTS: usize = 4096;
 const BATCH: usize = 32;
 const NONE: u32 = u32::MAX;
 
-/// Dedup record of one event row. `pc` is the payload address (0 when the row
-/// is invalid) with 16 check bits of the event id on top.
+/// Dedup record of one event row. `x` is `ingest_ts` under the arena offset
+/// of the row's payload (0 when the row is invalid). Rows are partitioned by
+/// bits of a second hash of the event id, so two ids are only ever taken for
+/// one when they agree on `h` and on those bits.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Key {
     h: u64,
-    pc: u64,
-    ingest: i64,
+    x: u64,
 }
 
-/// A valid event row. `np` is the address of the person's name, with `DEAD`
-/// set once dedup finds a copy that outranks this one. `w` packs
-/// `(ts - window_start, price_cents, category)` so that sorting by it sorts
-/// by time.
+/// A valid event row. `n1` gets `DEAD` once dedup finds a copy that outranks
+/// this one. `w` packs `(ts - window_start, price_cents, category)` so that
+/// sorting by it sorts by time.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Pay {
-    pk: u64,
-    np: u64,
+    n0: u64,
+    n1: u64,
     w: u64,
 }
 
@@ -71,7 +73,8 @@ struct Pay {
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Clk {
-    pk: u64,
+    n0: u64,
+    n1: u64,
     cp: u64,
     t: u64,
 }
@@ -127,6 +130,7 @@ impl SmallTab {
 }
 
 struct Ctx {
+    arena: Arena,
     w0: i64,
     /// Length of the event window in ms.
     wlen: u64,
@@ -144,10 +148,11 @@ struct Ctx {
 #[derive(Clone, Copy)]
 struct EvStage {
     eh: u64,
-    chk: u64,
-    ingest: i64,
+    part: u64,
+    ingest: u64,
     uh: u64,
     up: u64,
+    ulen: u64,
     ph: u64,
     tp: u64,
     valid: bool,
@@ -157,12 +162,13 @@ struct EvStage {
 struct ClStage {
     uh: u64,
     up: u64,
+    ulen: u64,
     cp: u64,
     t: u64,
 }
 
-struct Work {
-    slab: Slab,
+struct Work<'a> {
+    slab: Slab<'a>,
     keys: PartWriter<Key>,
     pays: PartWriter<Pay>,
     clks: PartWriter<Clk>,
@@ -395,7 +401,7 @@ unsafe fn event_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 7
     if ingest == ts::BAD {
         return;
     }
-    let (eh, chk) = hash2(base.add(b0 as usize), (e0 - b0) as usize);
+    let (eh, eh2) = hash2(base.add(b0 as usize), (e0 - b0) as usize);
     let t = ts::parse(base.add(f[2].0 as usize), (f[2].1 - f[2].0) as usize);
     let rel = t.wrapping_sub(ctx.w0) as u64;
     let user_len = (f[1].1 - f[1].0) as usize;
@@ -417,14 +423,15 @@ unsafe fn event_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 7
     }
     let s = w.ev.get_unchecked_mut(w.nev);
     s.eh = eh;
-    s.chk = chk as u64;
-    s.ingest = ingest;
+    s.part = eh2;
+    s.ingest = (ingest - ctx.w0 + (1 << (INGEST_BITS - 1))).clamp(0, INGEST_MASK as i64) as u64;
     s.valid = valid;
     if valid {
         let up = base.add(f[1].0 as usize);
         let pp = base.add(f[5].0 as usize);
         s.uh = hash(up, user_len);
         s.up = up as u64;
+        s.ulen = user_len as u64;
         s.ph = hash(pp, (f[5].1 - f[5].0) as usize);
         s.tp = (rel << (PRICE_BITS + ctx.cat_bits)) | (price << ctx.cat_bits);
         ctx.links.prefetch(s.uh);
@@ -442,14 +449,15 @@ unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
         let s = *w.ev.get_unchecked(i);
         let mut pay = 0u64;
         if s.valid {
-            let (pk, np) = ctx.links.lookup(s.uh, s.up);
+            let (pk, name) = ctx.links.lookup(s.uh, s.up as *const u8, s.ulen as usize);
             let c = ctx.products.get(s.ph);
             let cat = if c == NONE { ctx.unknown } else { c as u64 };
             let part = (pk >> PART_SHIFT) as usize & ctx.person_mask;
-            pay = w.pays.push(part, &mut w.slab, Pay { pk, np, w: s.tp | cat }) as u64;
+            let at = w.pays.push(part, &mut w.slab, Pay { n0: name.0, n1: name.1, w: s.tp | cat });
+            pay = ((at - ctx.arena.base) / Arena::UNIT) as u64;
         }
-        let part = (s.eh >> PART_SHIFT) as usize & ctx.ev_mask;
-        w.keys.push(part, &mut w.slab, Key { h: s.eh, pc: pay | (s.chk << 48), ingest: s.ingest });
+        let part = (s.part >> PART_SHIFT) as usize & ctx.ev_mask;
+        w.keys.push(part, &mut w.slab, Key { h: s.eh, x: (pay << INGEST_BITS) | s.ingest });
     }
     w.nev = 0;
 }
@@ -474,6 +482,7 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 4
     let s = w.cl.get_unchecked_mut(w.ncl);
     s.uh = hash(up, user_len);
     s.up = up as u64;
+    s.ulen = user_len as u64;
     s.cp = (base.add(f[0].0 as usize) as u64) | ((camp as u64) << 48);
     s.t = rel;
     ctx.links.prefetch(s.uh);
@@ -487,15 +496,15 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 4
 unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
     for i in 0..w.ncl {
         let s = *w.cl.get_unchecked(i);
-        let (pk, _) = ctx.links.lookup(s.uh, s.up);
+        let (pk, name) = ctx.links.lookup(s.uh, s.up as *const u8, s.ulen as usize);
         let part = (pk >> PART_SHIFT) as usize & ctx.person_mask;
-        w.clks.push(part, &mut w.slab, Clk { pk, cp: s.cp, t: s.t });
+        w.clks.push(part, &mut w.slab, Clk { n0: name.0, n1: name.1, cp: s.cp, t: s.t });
     }
     w.ncl = 0;
 }
 
 /// Marks every copy of an event but the one with the smallest `ingest_ts`.
-unsafe fn dedup_partition(blocks: &[Blk], table: &mut Vec<u64>) {
+unsafe fn dedup_partition(arena: &Arena, blocks: &[Blk], table: &mut Vec<u64>) {
     let n: usize = blocks.iter().map(|b| b.n as usize).sum();
     let cap = (n * 2).next_power_of_two().max(64);
     if table.len() < cap {
@@ -505,10 +514,10 @@ unsafe fn dedup_partition(blocks: &[Blk], table: &mut Vec<u64>) {
     tab.fill(0);
     let mask = cap - 1;
     let tab = tab.as_mut_ptr();
-    let kill = |pc: u64| {
-        let pay = (pc & PTR_MASK) as *mut Pay;
-        if !pay.is_null() {
-            (*pay).np |= DEAD;
+    let kill = |x: u64| {
+        let at = (x >> INGEST_BITS) as usize;
+        if at != 0 {
+            (*((arena.base + at * Arena::UNIT) as *mut Pay)).n1 |= DEAD;
         }
     };
     for blk in blocks {
@@ -526,12 +535,12 @@ unsafe fn dedup_partition(blocks: &[Blk], table: &mut Vec<u64>) {
                 }
                 if (e ^ h) & 0xFFFF == 0 {
                     let o = (e >> 16) as *const Key;
-                    if (*o).h == h && ((*o).pc ^ (*k).pc) >> 48 == 0 {
-                        if (*k).ingest < (*o).ingest {
-                            kill((*o).pc);
+                    if (*o).h == h {
+                        if (*k).x & INGEST_MASK < (*o).x & INGEST_MASK {
+                            kill((*o).x);
                             *tab.add(slot) = entry;
                         } else {
-                            kill((*k).pc);
+                            kill((*k).x);
                         }
                         break;
                     }
@@ -567,8 +576,7 @@ struct Agg<'a> {
     organic: usize,
     out: Out,
     slots: Vec<u32>,
-    pk: Vec<u64>,
-    name: Vec<u64>,
+    names: Vec<Name>,
     ev_end: Vec<u32>,
     ck_end: Vec<u32>,
     ev_idx: Vec<u32>,
@@ -608,8 +616,7 @@ impl<'a> Agg<'a> {
                 camp: vec![[0; 4]; (ncamp + 1) * ndays],
             },
             slots: Vec::new(),
-            pk: Vec::new(),
-            name: Vec::new(),
+            names: Vec::new(),
             ev_end: Vec::new(),
             ck_end: Vec::new(),
             ev_idx: Vec::new(),
@@ -640,8 +647,7 @@ impl<'a> Agg<'a> {
         self.slots[..cap].fill(0);
         let mask = cap - 1;
         let slots = self.slots.as_mut_ptr();
-        self.pk.clear();
-        self.name.clear();
+        self.names.clear();
         self.ev_end.clear();
         self.ev_idx.clear();
         self.ev_w.clear();
@@ -649,21 +655,21 @@ impl<'a> Agg<'a> {
             let base = blk.ptr as *const Pay;
             for i in 0..blk.n as usize {
                 let p = *base.add(i);
-                if p.np & DEAD != 0 {
+                if p.n1 & DEAD != 0 {
                     continue;
                 }
-                let mut slot = (p.pk >> 8) as usize & mask;
+                let name = (p.n0, p.n1);
+                let mut slot = (name_hash(name) >> 32) as usize & mask;
                 let idx = loop {
                     let s = *slots.add(slot);
                     if s == 0 {
-                        let idx = self.pk.len() as u32;
+                        let idx = self.names.len() as u32;
                         *slots.add(slot) = idx + 1;
-                        self.pk.push(p.pk);
-                        self.name.push(p.np);
+                        self.names.push(name);
                         self.ev_end.push(0);
                         break idx;
                     }
-                    if *self.pk.get_unchecked(s as usize - 1) == p.pk {
+                    if same_name(*self.names.get_unchecked(s as usize - 1), name) {
                         break s - 1;
                     }
                     slot = (slot + 1) & mask;
@@ -673,7 +679,7 @@ impl<'a> Agg<'a> {
                 self.ev_w.push(p.w);
             }
         }
-        let people = self.pk.len();
+        let people = self.names.len();
         if people == 0 {
             return;
         }
@@ -685,13 +691,14 @@ impl<'a> Agg<'a> {
             let base = blk.ptr as *const Clk;
             for i in 0..blk.n as usize {
                 let c = *base.add(i);
-                let mut slot = (c.pk >> 8) as usize & mask;
+                let name = (c.n0, c.n1);
+                let mut slot = (name_hash(name) >> 32) as usize & mask;
                 loop {
                     let s = *slots.add(slot);
                     if s == 0 {
                         break;
                     }
-                    if *self.pk.get_unchecked(s as usize - 1) == c.pk {
+                    if same_name(*self.names.get_unchecked(s as usize - 1), name) {
                         *self.ck_end.get_unchecked_mut(s as usize - 1) += 1;
                         self.ck_idx.push(s - 1);
                         self.ck_raw.push((c.t, c.cp));
@@ -740,7 +747,7 @@ impl<'a> Agg<'a> {
             if ck_to - ck_at > 1 {
                 self.cks[ck_at..ck_to].sort_unstable_by_key(|c| c.0);
             }
-            self.person(*self.name.get_unchecked(p), ev_at, ev_to, ck_at, ck_to);
+            self.person(*self.names.get_unchecked(p), ev_at, ev_to, ck_at, ck_to);
             ev_at = ev_to;
             ck_at = ck_to;
         }
@@ -764,10 +771,22 @@ impl<'a> Agg<'a> {
     }
 
     #[inline(always)]
-    unsafe fn user_row(&mut self, name: &[u8], day: u32, sessions: u32, events: u32, revenue: u64) {
+    unsafe fn user_row(&mut self, name: Name, day: u32, sessions: u32, events: u32, revenue: u64) {
         let o = &mut self.out;
-        o.names.extend_from_slice(&(name.len() as u32).to_le_bytes());
-        o.names.extend_from_slice(name);
+        if name.1 & LONG == 0 {
+            // Length, then both words: the bytes past the length are dropped.
+            let len = (name.1 >> 56) as usize;
+            o.names.reserve(20);
+            let at = o.names.as_mut_ptr().add(o.names.len());
+            (at as *mut u32).write_unaligned(len as u32);
+            (at.add(4) as *mut u64).write_unaligned(name.0);
+            (at.add(12) as *mut u64).write_unaligned(name.1);
+            o.names.set_len(o.names.len() + 4 + len);
+        } else {
+            let bytes = id_bytes(name.1 & ADDR);
+            o.names.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            o.names.extend_from_slice(bytes);
+        }
         o.day.push(self.day0 + day as i32);
         o.sessions.push(sessions as i32);
         o.events.push(events as i32);
@@ -793,8 +812,7 @@ impl<'a> Agg<'a> {
         o.rows += 1;
     }
 
-    unsafe fn person(&mut self, name: u64, ev_at: usize, ev_to: usize, ck_at: usize, ck_to: usize) {
-        let name = id_bytes(name & PTR_MASK);
+    unsafe fn person(&mut self, name: Name, ev_at: usize, ev_to: usize, ck_at: usize, ck_to: usize) {
         let cat_bits = self.ctx.cat_bits;
         let shift = PRICE_BITS + cat_bits;
         let cat_mask = (1u64 << cat_bits) - 1;
@@ -875,7 +893,7 @@ impl<'a> Agg<'a> {
                 let mut j = best;
                 while j > lo && (*ck.add(j - 1)).0 == t {
                     j -= 1;
-                    if id_bytes((*ck.add(j)).1 & PTR_MASK) < id_bytes((*ck.add(best)).1 & PTR_MASK) {
+                    if id_bytes((*ck.add(j)).1 & ADDR) < id_bytes((*ck.add(best)).1 & ADDR) {
                         best = j;
                     }
                 }
@@ -1012,6 +1030,7 @@ fn main() {
     let ev_parts = parts_for(event_bytes / 80, per_part);
     let person_parts = parts_for(event_bytes / 80 + click_bytes / 50, per_part);
     let ctx = Ctx {
+        arena: Arena::new(),
         w0,
         wlen,
         links,
@@ -1042,10 +1061,11 @@ fn main() {
     let next = AtomicUsize::new(0);
     let scattered = par_map(threads, |_| {
         let mut sc = Scan::new();
-        let blank_ev = EvStage { eh: 0, chk: 0, ingest: 0, uh: 0, up: 0, ph: 0, tp: 0, valid: false };
-        let blank_cl = ClStage { uh: 0, up: 0, cp: 0, t: 0 };
+        let blank_ev =
+            EvStage { eh: 0, part: 0, ingest: 0, uh: 0, up: 0, ulen: 0, ph: 0, tp: 0, valid: false };
+        let blank_cl = ClStage { uh: 0, up: 0, ulen: 0, cp: 0, t: 0 };
         let mut w = Work {
-            slab: Slab::new(),
+            slab: Slab::new(&ctx.arena),
             keys: PartWriter::new(ev_parts),
             pays: PartWriter::new(person_parts),
             clks: PartWriter::new(person_parts),
@@ -1109,7 +1129,7 @@ fn main() {
             let Some(blocks) = keys.get(next.fetch_add(1, Relaxed)) else {
                 break;
             };
-            unsafe { dedup_partition(blocks, &mut table) };
+            unsafe { dedup_partition(&ctx.arena, blocks, &mut table) };
         }
     });
     lap("dedup");

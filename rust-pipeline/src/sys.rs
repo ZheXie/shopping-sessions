@@ -6,6 +6,7 @@ use std::marker::PhantomData;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 /// Readable slack guaranteed after every `Buf`, so wide loads never fault.
 pub const SLACK: usize = 64;
@@ -93,15 +94,60 @@ pub fn anon(bytes: usize) -> *mut u8 {
     }
 }
 
-/// Bump allocator over `anon` chunks. Memory is never returned.
-pub struct Slab {
+/// One reserved range of address space that every thread's records are
+/// carved from, so a record is named by a small offset.
+pub struct Arena {
+    pub base: usize,
+    size: usize,
+    next: AtomicUsize,
+}
+
+impl Arena {
+    pub const UNIT: usize = 8;
+    /// Offsets in `UNIT`s fit in 31 bits.
+    const MAX: usize = 16 << 30;
+
+    pub fn new() -> Arena {
+        const HP: usize = 2 << 20;
+        let mut size = Self::MAX;
+        loop {
+            let p = unsafe {
+                libc::mmap(
+                    null_mut(),
+                    size + HP,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                    -1,
+                    0,
+                )
+            };
+            if p != libc::MAP_FAILED {
+                let base = (p as usize + HP - 1) & !(HP - 1);
+                unsafe { libc::madvise(base as *mut libc::c_void, size, libc::MADV_HUGEPAGE) };
+                return Arena { base, size: size - HP, next: AtomicUsize::new(HP) };
+            }
+            size /= 2;
+            assert!(size >= 64 << 20, "cannot reserve address space");
+        }
+    }
+
+    fn chunk(&self, bytes: usize) -> usize {
+        let at = self.next.fetch_add(bytes, Relaxed);
+        assert!(at + bytes <= self.size, "record arena exhausted");
+        self.base + at
+    }
+}
+
+/// Bump allocator over chunks of an `Arena`. Memory is never returned.
+pub struct Slab<'a> {
+    arena: &'a Arena,
     cur: usize,
     end: usize,
 }
 
-impl Slab {
-    pub const fn new() -> Self {
-        Slab { cur: 0, end: 0 }
+impl<'a> Slab<'a> {
+    pub fn new(arena: &'a Arena) -> Self {
+        Slab { arena, cur: 0, end: 0 }
     }
 
     #[inline(always)]
@@ -117,10 +163,9 @@ impl Slab {
     #[cold]
     #[inline(never)]
     fn grow(&mut self, bytes: usize) {
-        let size = bytes.max(32 << 20);
-        let p = anon(size) as usize;
-        self.cur = p;
-        self.end = p + size;
+        let size = bytes.max(4 << 20);
+        self.cur = self.arena.chunk(size);
+        self.end = self.cur + size;
     }
 }
 

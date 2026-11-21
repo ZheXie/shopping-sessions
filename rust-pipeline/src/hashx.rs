@@ -60,12 +60,12 @@ pub unsafe fn hash(p: *const u8, len: usize) -> u64 {
     mum(lo ^ S0 ^ (len as u64), hi ^ S1)
 }
 
-/// The same hash plus 16 independent check bits.
+/// The same hash plus a second, independent one.
 #[inline(always)]
-pub unsafe fn hash2(p: *const u8, len: usize) -> (u64, u16) {
+pub unsafe fn hash2(p: *const u8, len: usize) -> (u64, u64) {
     let (a, b, seed) = words(p, len);
     let (lo, hi) = mul(a ^ S1, b ^ seed);
     let h = mum(lo ^ S0 ^ (len as u64), hi ^ S1);
     let c = mum(a ^ S2 ^ seed.rotate_left(23), b ^ S3 ^ (len as u64).wrapping_mul(S1));
-    (h, (c >> 40) as u16)
+    (h, c)
 }

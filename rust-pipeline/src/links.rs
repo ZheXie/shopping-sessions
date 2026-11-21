@@ -3,11 +3,13 @@
 //!
 //! A root is only ever linked under a root with a byte-wise smaller name, so
 //! the root of every tree is the person's name. After the unions each slot is
-//! rewritten to `(id hash) -> (person key, person name)` for one-probe lookups.
+//! rewritten in place to `(id hash) -> (person key, person name)`, so a
+//! lookup is one probe and never touches the name's bytes.
 
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
 
+use crate::hashx::r8;
 use crate::sys::{anon, par_map};
 
 /// An ID's bytes end at the first of these: IDs hold none of them and every
@@ -30,16 +32,66 @@ pub unsafe fn id_bytes<'a>(p: u64) -> &'a [u8] {
     std::slice::from_raw_parts(p, id_len(p))
 }
 
-#[repr(C)]
+/// A name in 16 bytes. Up to 15 bytes are stored inline, zero padded, with
+/// the length in the top byte of the second word. A longer name is its hash
+/// and, under `LONG`, its address. Bit 63 is always clear.
+pub type Name = (u64, u64);
+pub const LONG: u64 = 1 << 62;
+pub const ADDR: u64 = (1 << 48) - 1;
+
+static KEEP: [(u64, u64); 16] = {
+    let mut t = [(0u64, 0u64); 16];
+    let mut len = 0;
+    while len < 16 {
+        t[len] = if len >= 8 {
+            (u64::MAX, (1u64 << (8 * (len - 8))) - 1)
+        } else {
+            ((1u64 << (8 * len)) - 1, 0)
+        };
+        len += 1;
+    }
+    t
+};
+
+/// `hash` must be the name's hash. Reads 16 bytes at `p`.
+#[inline(always)]
+pub unsafe fn name_of(p: *const u8, len: usize, hash: u64) -> Name {
+    if len < 16 {
+        let (k0, k1) = *KEEP.get_unchecked(len);
+        (r8(p) & k0, (r8(p.add(8)) & k1) | ((len as u64) << 56))
+    } else {
+        (hash, p as u64 | LONG)
+    }
+}
+
+#[inline(always)]
+pub fn same_name(a: Name, b: Name) -> bool {
+    a.0 == b.0 && (a.1 == b.1 || a.1 & b.1 & LONG != 0)
+}
+
+/// A well-mixed word of a name, the same for every copy of it.
+#[inline(always)]
+pub fn name_hash(n: Name) -> u64 {
+    let inline = ((n.1 >> 62) & 1).wrapping_sub(1);
+    (n.0 ^ (n.1 & inline).rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+/// While linking: `[id hash, address of the id, first 8 bytes big-endian,
+/// parent slot]`. Afterwards: `[id hash, person key, name.0, name.1]`.
+/// An id hash of 0 marks an empty slot.
+#[repr(C, align(32))]
 struct Node {
-    /// Hash of this ID; 0 marks an empty slot.
     key: AtomicU64,
-    /// While linking: pointer to this ID's bytes. Afterwards: the person's name.
     a: u64,
-    /// While linking: first 8 name bytes, big-endian. Afterwards: the person key.
     b: u64,
-    parent: AtomicU32,
-    _pad: u32,
+    c: AtomicU64,
+}
+
+impl Node {
+    #[inline(always)]
+    fn parent(&self) -> &AtomicU32 {
+        unsafe { &*(&self.c as *const AtomicU64 as *const AtomicU32) }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -54,7 +106,7 @@ pub struct Edge {
 
 pub struct Table {
     nodes: *mut Node,
-    mask: usize,
+    cap: usize,
 }
 unsafe impl Send for Table {}
 unsafe impl Sync for Table {}
@@ -85,36 +137,40 @@ const GRAIN: usize = 4096;
 impl Table {
     #[inline(always)]
     fn slot(&self, h: u64) -> usize {
-        (h >> 20) as usize & self.mask
+        ((h as u128 * self.cap as u128) >> 64) as usize
     }
 
     #[inline(always)]
     pub unsafe fn prefetch(&self, h: u64) {
         if !self.nodes.is_null() {
-            _mm_prefetch(self.nodes.add(self.slot(h)) as *const i8, _MM_HINT_T0);
+            let p = self.nodes.add(self.slot(h)) as *const i8;
+            _mm_prefetch(p, _MM_HINT_T0);
+            _mm_prefetch(p.add(64), _MM_HINT_T0);
         }
     }
 
-    /// `(person key, pointer to the person's name)` for the ID with hash `h`
-    /// whose own bytes are at `own`.
+    /// `(person key, person name)` for the ID at `p` whose hash is `h`.
     #[inline(always)]
-    pub unsafe fn lookup(&self, h: u64, own: u64) -> (u64, u64) {
-        if self.nodes.is_null() {
-            return (h, own);
-        }
-        let key = fix(h);
-        let mut i = self.slot(h);
-        loop {
-            let n = &*self.nodes.add(i);
-            let k = n.key.load(Relaxed);
-            if k == key {
-                return (n.b, n.a);
+    pub unsafe fn lookup(&self, h: u64, p: *const u8, len: usize) -> (u64, Name) {
+        if !self.nodes.is_null() {
+            let key = fix(h);
+            let mut i = self.slot(h);
+            loop {
+                let n = &*self.nodes.add(i);
+                let k = n.key.load(Relaxed);
+                if k == key {
+                    return (n.a, (n.b, n.c.load(Relaxed)));
+                }
+                if k == 0 {
+                    break;
+                }
+                i += 1;
+                if i == self.cap {
+                    i = 0;
+                }
             }
-            if k == 0 {
-                return (h, own);
-            }
-            i = (i + 1) & self.mask;
         }
+        (h, name_of(p, len, h))
     }
 
     unsafe fn insert(&self, h: u64, ptr: u64, pre: u64) -> u32 {
@@ -131,20 +187,23 @@ impl Table {
                     Ok(_) => {
                         (*n).a = ptr;
                         (*n).b = pre;
-                        (*n).parent.store(i as u32, Relaxed);
+                        (*n).parent().store(i as u32, Relaxed);
                         return i as u32;
                     }
                     Err(now) if now == key => return i as u32,
                     Err(_) => {}
                 }
             }
-            i = (i + 1) & self.mask;
+            i += 1;
+            if i == self.cap {
+                i = 0;
+            }
         }
     }
 
     #[inline(always)]
     unsafe fn parent(&self, x: u32) -> &AtomicU32 {
-        &(*self.nodes.add(x as usize)).parent
+        (*self.nodes.add(x as usize)).parent()
     }
 
     /// Root of `x`, halving the path. A non-root's parent only ever moves to
@@ -192,14 +251,12 @@ impl Table {
     pub fn build(edge_lists: &[Vec<Edge>], threads: usize) -> Table {
         let total: usize = edge_lists.iter().map(|v| v.len()).sum();
         if total == 0 {
-            return Table { nodes: std::ptr::null_mut(), mask: 0 };
+            return Table { nodes: std::ptr::null_mut(), cap: 0 };
         }
-        // At most 2 * total IDs: the load factor stays at or under 0.75.
-        let cap = (total * 8 / 3 + 16).next_power_of_two();
-        let table = Table {
-            nodes: anon(cap * std::mem::size_of::<Node>()) as *mut Node,
-            mask: cap - 1,
-        };
+        // At most 2 * total IDs, and usually far fewer.
+        let cap = total * 9 / 4 + 16;
+        assert!(cap < u32::MAX as usize, "too many links");
+        let table = Table { nodes: anon(cap * std::mem::size_of::<Node>()) as *mut Node, cap };
         // (list, first edge, last edge, index of the first edge overall)
         let mut tasks: Vec<(usize, usize, usize, usize)> = Vec::new();
         let mut seen = 0usize;
@@ -254,36 +311,72 @@ impl Table {
                     }
                 }
             });
-            // Rewrite every slot to (person key, person name). Other slots
-            // only read a root's `key` and `a`, which a root never rewrites.
+            // Point every ID straight at its root. A walk that crosses a slot
+            // being rewritten sees its old parent or its root, both above it.
+            let next = AtomicUsize::new(0);
+            let roots = par_map(threads, |_| {
+                let mut roots: Vec<u32> = Vec::new();
+                loop {
+                    let lo = next.fetch_add(GRAIN * 4, Relaxed);
+                    if lo >= cap {
+                        break;
+                    }
+                    for s in lo..(lo + GRAIN * 4).min(cap) {
+                        if (*t.nodes.add(s)).key.load(Relaxed) == 0 {
+                            continue;
+                        }
+                        let mut r = s as u32;
+                        loop {
+                            let p = t.parent(r).load(Relaxed);
+                            if p == r {
+                                break;
+                            }
+                            r = p;
+                        }
+                        if r as usize == s {
+                            roots.push(r);
+                        } else {
+                            t.parent(s as u32).store(r, Relaxed);
+                        }
+                    }
+                }
+                roots
+            });
+            // Rewrite the other IDs from their roots, which stay as they are
+            // until every other ID is done.
             let next = AtomicUsize::new(0);
             par_map(threads, |_| loop {
                 let lo = next.fetch_add(GRAIN * 4, Relaxed);
                 if lo >= cap {
                     break;
                 }
-                let hi = (lo + GRAIN * 4).min(cap);
-                for s in lo..hi {
+                for s in lo..(lo + GRAIN * 4).min(cap) {
                     let n = t.nodes.add(s);
-                    let key = (*n).key.load(Relaxed);
-                    if key == 0 {
+                    if (*n).key.load(Relaxed) == 0 {
                         continue;
                     }
-                    let mut r = s as u32;
-                    loop {
-                        let p = t.parent(r).load(Relaxed);
-                        if p == r {
-                            break;
-                        }
-                        r = p;
+                    let r = (*n).parent().load(Relaxed) as usize;
+                    if r == s {
+                        continue;
                     }
-                    if r as usize == s {
-                        (*n).b = key;
-                    } else {
-                        let root = t.nodes.add(r as usize);
-                        (*n).a = (*root).a;
-                        (*n).b = (*root).key.load(Relaxed);
-                    }
+                    let root = t.nodes.add(r);
+                    let key = (*root).key.load(Relaxed);
+                    let p = (*root).a as *const u8;
+                    let name = name_of(p, id_len(p), key);
+                    (*n).a = key;
+                    (*n).b = name.0;
+                    (*n).c.store(name.1, Relaxed);
+                }
+            });
+            par_map(roots.len(), |i| {
+                for &r in &roots[i] {
+                    let n = t.nodes.add(r as usize);
+                    let key = (*n).key.load(Relaxed);
+                    let p = (*n).a as *const u8;
+                    let name = name_of(p, id_len(p), key);
+                    (*n).a = key;
+                    (*n).b = name.0;
+                    (*n).c.store(name.1, Relaxed);
                 }
             });
         }

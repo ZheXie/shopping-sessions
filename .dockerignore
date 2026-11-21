@@ -1,9 +1,13 @@
-reference/
-scripts/
 fixtures/
 dev/
 out/
+scratch/
 *.md
 .git
-rust/target/
-build/
+dev-answer/
+pipeline/
+scripts/*
+!scripts/build_pgo.sh
+third_party/generator/target/
+target/
+rust-pipeline/target/

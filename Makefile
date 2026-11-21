@@ -1,38 +1,44 @@
 IMAGE ?= shopping-sessions:latest
-CXXFLAGS ?= -O3 -march=x86-64-v3 -std=c++17 -pthread
-BIN ?= build/ss
-DEV ?= dev
-ANSWER ?= dev-answer
+CPUS  ?= 8
+MEM   ?= 24g
+PLATFORM ?= linux/amd64
+DEV   ?= dev
+FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
+BIN ?= rust-pipeline/target/release/shopping-sessions
+export IMAGE CPUS MEM PLATFORM
 
-.PHONY: bin fixtures check-dev fuzz build run-dev rust rust-fixtures
+.PHONY: build build-local build-local-pgo fixtures dev run-dev check-dev
 
-## Native build (Linux, g++ 11+)
-bin:
-	mkdir -p build && g++ $(CXXFLAGS) -o $(BIN) src/ss.cpp
-
-## All 36 edge-case fixtures (needs polars for the checker)
-fixtures: bin
-	python3 scripts/run_fixtures.py fixtures -- $(BIN)
-
-## Run on the 1M dev set and diff with the published answer
-check-dev: bin
-	rm -rf out && $(BIN) $(DEV) out && python3 scripts/compare.py out $(ANSWER)
-
-## Differential fuzz against the slow reference (needs polars, pyarrow)
-fuzz: bin
-	COMPARE=scripts/compare.py python3 reference/fuzz.py $(BIN) 500
-
-## Docker image exactly as the scorer builds it
+## Build the scorer image (linux/amd64)
 build:
-	docker buildx build --platform linux/amd64 --load -t $(IMAGE) .
+	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) .
 
-run-dev: build
-	rm -rf out && time scripts/docker_run.sh $(DEV) out
+## Release binary for local loops (flags in rust-pipeline/.cargo/config.toml)
+build-local:
+	cd rust-pipeline && cargo build --release
 
-## Rust build (the default Dockerfile builds this)
-rust:
-	mkdir -p build
-	cd rust && cargo build --release && cp target/release/ss ../build/ss-rust
+## Match the scorer image's profile-guided build (needs llvm-tools-preview)
+build-local-pgo:
+	sh scripts/build_pgo.sh
 
-rust-fixtures: rust
-	python3 scripts/run_fixtures.py fixtures -- build/ss-rust
+## Run all 36 fixtures against the local binary
+fixtures: build-local
+	python3 scripts/run_fixtures.py $(FIXTURES) -- $(BIN)
+
+## Generate the 1M-event dev set
+dev:
+	generate --seed 1 --events 1000000 --clicks 250000 --output $(DEV)
+
+## Timed run on the local binary
+run-dev: build-local
+	rm -rf out && mkdir -p out scratch
+	NCPU=$(CPUS) DATA_DIR=$(DEV) OUTPUT_DIR=out SCRATCH_DIR=scratch time $(BIN)
+
+## Exact diff against published dev-answer
+ANSWER ?= dev-answer
+check-dev:
+	PYTHONPATH=scripts python3 scripts/compare.py out $(ANSWER)
+
+## Docker run on fixtures (scorer-shaped)
+fixtures-docker: build
+	python3 scripts/run_fixtures.py $(FIXTURES) -- scripts/docker_run.sh

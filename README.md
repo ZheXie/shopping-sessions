@@ -1,95 +1,110 @@
-# Shopping Sessions: Rust pipeline (and the same in C++)
+# Shopping Sessions (Databricks Buildathon)
 
-One static binary that implements `rules.md` exactly and writes both Parquet
-tables with a small built-in writer. There are two implementations of the same
-design, with identical output:
+Exact ETL for dirty click-stream logs → two daily Parquet tables. Fastest correct container wins.
 
-- `rust/` (std only, no crates): the one the `Dockerfile` builds. About 9%
-  faster than the C++ build.
-- `src/ss.cpp` (C++17, no dependencies): builds with `Dockerfile.cpp`.
+**Spec:** [rules.md](./rules.md) (authoritative)  
+**Plan:** [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md)  
+**Track:** https://www.joinbuilders.org/buildathon/tracks/shopping-sessions
 
-## Results (20M events, warm page cache)
+## Performance and validation
 
-| Setup | Rust | C++ |
-| --- | --- | --- |
-| Scorer stand-in: 4 cores, no transparent hugepages | ~0.95 s | ~1.05 s |
+The scored entry is the Rust binary built by the root Dockerfile. These local
+medians compare the optimized entry to upstream commit `ad075c9`.
 
-The scorer (8 vCPU = 4 Cascade Lake cores with hyperthreads) is much slower
-than this machine. `taskset -c 0-3 env SS_NOTHP=1 BIN DATA OUT` reproduced the
-first board score (2.36 s locally, 2.3 s on the board), so it is the local
-stand-in. Under it, the versions so far went 2.36 s -> 1.67 s -> 1.05 s (C++)
--> 0.95 s (Rust).
+| Generated input | Seed | Binary, original → optimized | Rootless OCI, original → optimized |
+| --- | ---: | ---: | ---: |
+| 20M events + 5M clicks | 714 | 0.562 → **0.359 s** | 0.657 → **0.441 s** |
+| 20M events + 5M clicks | 88231 | 0.542 → **0.382 s** | 0.676 → **0.441 s** |
+| 60M events + 15M clicks | 4213 | 2.040 → **1.259 s** | 2.097 → **1.549 s** |
 
-At 40M events the Rust run peaks at 2.0 GB of memory (limit 24 GB), and its
-output is identical to the C++ output. The PySpark starter baseline on the
-board is 171.91 s.
+WSL2 on a Ryzen 7 7800X3D, eight visible CPUs, warm page cache, Linux
+filesystem for input and output, rustc 1.100.0. Each pair used the same input,
+alternating the order and creating fresh output directories. The 20M medians use
+seven process runs and five OCI runs per binary, after one warmup. The 60M
+medians use three runs after warmup. Process timing includes exit and memory
+reclamation. OCI timing spans `runc run` through exit with read-only input and
+rootfs, private networking, host runtime libraries and eight CPUs. The Docker
+daemon was unavailable on this host. Official hidden-set timing is pending.
 
-## Correctness checks
+- All 36 published fixtures pass with automatic SIMD dispatch and with AVX2 forced.
+- Both tables on the public seed-1 dev set match the published answer exactly.
+- Both 20M datasets and the 60M dataset match the original release output in
+  every column with zero duplicate keys. The 60M result contains 6,643,296
+  user rows and 28,014 campaign rows. Peak RSS fell from 9.17 to 3.77 GiB
+  in the local 60M correctness runs.
+- Targeted regressions check UTF-8 and embedded NUL IDs, tied clicks, malformed
+  and cross-chunk rows, missing final newlines, and duplicate ingest dates
+  outside the inline range. The earliest copy still wins across centuries.
+- The Python reference remains in `pipeline/pipeline.py`.
 
-- 36/36 fixtures (`make fixtures`).
-- Exact match with the published dev answer (`make check-dev`).
-- Exact match with `reference/reference.py`, a slow, literal Python version of
-  the rules, on seeds 2 to 6 (1M events each) and seed 31 (5M events).
-- `reference/fuzz.py`: thousands of random, very dirty small datasets (quotes,
-  `\r`, bad timestamps and offsets, long and odd IDs, links, duplicates, files
-  without a final newline, header-only files), with random chunk and buffer
-  sizes to hit every boundary in the reader: 0 differences.
-- The dev set also matches with 1-byte chunks and 64-byte read buffers.
-- The fast timestamp parser and the fast product lookup were each checked
-  against the plain versions on millions of valid and mutated strings.
+## Build and check
 
-## How it works
+The release target is Linux x86-64-v3. The container builds the scorer binary
+with profile-guided optimization (PGO). The build trains on the public generator
+with both automatic SIMD dispatch and the AVX2 fallback. Only the stripped
+binary goes into the runtime image.
 
-1. **Links first.** Parse `links/` in parallel, intern every ID per hash bucket,
-   then run union-find on a background thread while the events parse. The root
-   of each set is its byte-wise smallest ID, which is the person's name.
-2. **Parse events and clicks** with `pread` into reusable 1 MB per-thread
-   buffers. Lines are split with AVX2 masks for commas, quotes and newlines.
-   Timestamps use SIMD for epoch-ms and a branch-light fixed-layout parse for
-   the ISO forms. Each valid, non-late event goes straight into its user-ID
-   bucket (16 bytes). Every well-formed copy, valid or not, also writes a
-   16-byte dedup entry into its event-ID bucket: `event_id`, `ingest_ts` in
-   seconds, and where the copy's event record is.
-3. **Dedup** per event-ID bucket: the copy with the smallest `ingest_ts` wins,
-   and every other copy is marked dead in a bitmap. Dedup comes before
-   validation, so an invalid winner still removes later valid copies.
-4. **Person mapping** per user-ID bucket, through that bucket's slice of the
-   link table, which stays in cache. Events and clicks are re-bucketed by person.
-5. **Sessions** per person bucket: a radix sort of the bucket by `ts` and a
-   stable scatter by person give each person's events in time order; sessions
-   split on gaps over 30 minutes and take the day they start. Credit and
-   assists use one sliding window over the person's clicks sorted by
-   (`ts`, `click_id`). Assists are counted as ranges of sessions per
-   campaign, so whales with many clicks cost O(clicks + sessions).
-   `user_daily` rows are written as each bucket finishes, one Parquet row
-   group per bucket.
-6. **Output.** Uncompressed PLAIN Parquet.
+```sh
+make build
+make fixtures-docker
 
-**IDs are 8-byte keys.** The generator's IDs are 1 to 10 characters of
-`[0-9A-Za-z]`. Each character becomes a 6-bit symbol, ordered like ASCII, so
-the key is exact and comparing keys as integers is byte-wise string order.
-Packing is done with SIMD. Any other ID becomes a 63-bit hash plus an entry in
-a registry of its bytes, so unusual IDs (spaces, other characters, longer than
-10) stay correct.
+# Fast local development build
+make build-local
+make fixtures
+(cd rust-pipeline && cargo test --release)
 
-**Memory is the main cost on the scorer.** Without transparent hugepages,
-every fresh 4 KB page costs a fault and a zeroing on the way in and a free on
-the way out. So records are small (16 to 24 bytes), and 64 MB segments are
-pooled and handed from one phase to the next. Each block is given back to the
-kernel right after its last read, on all workers in parallel, which leaves
-little for the exit teardown.
+# Match the scorer build locally
+rustup component add llvm-tools-preview
+make build-local-pgo
+python3 scripts/test_regressions.py rust-pipeline/target/release/shopping-sessions
 
-## Layout
+# Public dev answer, using the generator on PATH
+make dev
+NCPU=8 DATA_DIR=dev OUTPUT_DIR=out rust-pipeline/target/release/shopping-sessions
+make check-dev
+```
 
-- `rust/`: the Rust pipeline (`src/main.rs` phases; `csv.rs`, `ts.rs`, `ids.rs`,
-  `maps.rs`, `parquet.rs`, `sys.rs` for memory and threads). `cargo test
-  --release` runs the lookup self-check.
-- `Dockerfile`: builds `rust/` on `rust:1.83-slim-bookworm` (static), runs from `scratch`.
-- `src/ss.cpp`, `Dockerfile.cpp`: the C++ version of the same pipeline.
-- `reference/reference.py`, `reference/fuzz.py`: the slow reference and the differential fuzzer.
-- `scripts/`, `fixtures/`, `rules.md`: from the official starter.
+Use a fresh output directory for each invocation. The benchmark harness does so
+automatically, warms up each binary once, alternates the run order, and times
+the entire child process. To build a baseline and reproduce a practice run:
 
-Test hooks (never set by the scorer): `SS_CHUNK` (task size in bytes),
-`SS_RBUF` (read buffer bytes), `SS_NOTHP` (no hugepage advice),
-`SS_NOFREE` (keep pages until exit), `SS_DEBUG` (memory stats). Phase
-timings go to stderr.
+```sh
+scratch=$(mktemp -d)
+git archive ad075c9 rust-pipeline | tar -x -C "$scratch"
+(cd "$scratch/rust-pipeline" && cargo build --release --locked)
+cargo build --release --locked --manifest-path third_party/generator/Cargo.toml
+third_party/generator/target/release/generate --seed 714 --events 20000000 --clicks 5000000 --output "$scratch/practice"
+python3 scripts/benchmark.py "$scratch/practice" "$scratch/rust-pipeline/target/release/shopping-sessions" rust-pipeline/target/release/shopping-sessions --runs 7
+```
+
+## Implementation
+
+- Parser threads read large event files into reusable buffers with `pread`.
+  A read-only mapping provides stable addresses for IDs needed after parsing.
+  SIMD builds an index of delimiters and wrapping quotes while checking the
+  contest dialect. AVX-512 byte compression is selected on capable CPUs.
+- Linked IDs use a compact concurrent union-find. Common short IDs have a
+  reversible one-word representation. Other IDs compare by their full bytes.
+- Parsing scatters 16-byte event keys and 16-byte payloads. Dedup keeps the
+  earliest ingest even when the winning event fails validation. Only purchases
+  look up a product category.
+- Larger person partitions start first. Small groups can use SIMD sorting
+  networks, and large groups use a time radix sort when their timestamp range
+  permits it. Sessionization and the seven-day attribution window run per person.
+- Each worker writes its own Parquet file. A dictionary stores each person ID
+  once per worker, and run-length encoding covers consecutive daily rows.
+  Campaign totals use a final reduction.
+
+The runtime takes `DATA_DIR`, `OUTPUT_DIR` and `NCPU`. Set `SS_TIMING=1` for
+stage diagnostics, `SS_AVX2=1` to exercise the AVX2 fallback, or `SS_READ=mmap`
+to compare the mapped event reader. The benchmark harness disables timing
+diagnostics to exclude memory-reporting overhead.
+
+## Submit
+
+Public GitHub repo with root `Dockerfile`, e.g. https://github.com/ZheXie/shopping-sessions  
+Sync from Origin:
+
+```sh
+cd ~/shiaoping && git pull origin main && git push github main
+```

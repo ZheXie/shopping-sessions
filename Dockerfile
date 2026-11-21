@@ -1,16 +1,18 @@
-# Shopping Sessions: Rust pipeline (rust/), one static binary, no crates.
-# rust/.cargo/config.toml sets the scorer's CPU baseline (x86-64-v3: AVX2,
-# BMI2; the Cascade Lake scorers support it) and static linking.
-# The C++ version of the same pipeline builds with Dockerfile.cpp.
-FROM rust:1.83-slim-bookworm AS build
+# Shopping Sessions — Rust pipeline (scorers are linux/amd64 and build natively).
+FROM rust:1-bookworm AS builder
 WORKDIR /src
-COPY rust/ .
-# Same flags as rust/.cargo/config.toml, set here too so the build never
-# depends on that file: AVX2 baseline and a static binary for scratch.
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
-RUN cargo build --release --target x86_64-unknown-linux-gnu  && cp target/x86_64-unknown-linux-gnu/release/ss /ss
+ENV CARGO_TERM_COLOR=never \
+    RUSTFLAGS="-C target-cpu=x86-64-v3"
+COPY rust-pipeline/ rust-pipeline/
+COPY third_party/generator/ third_party/generator/
+COPY scripts/build_pgo.sh scripts/build_pgo.sh
+RUN rustup component add llvm-tools-preview \
+ && sh scripts/build_pgo.sh \
+ && strip -s rust-pipeline/target/release/shopping-sessions
 
-FROM scratch
-COPY --from=build /ss /ss
-# Runs as uid 1000 with a read-only root; reads $DATA_DIR, writes $OUTPUT_DIR.
-CMD ["/ss"]
+FROM debian:bookworm-slim
+RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
+COPY --from=builder /src/rust-pipeline/target/release/shopping-sessions /app/shopping-sessions
+WORKDIR /app
+# The binary reads DATA_DIR / OUTPUT_DIR / NCPU itself; no shell in between.
+CMD ["/app/shopping-sessions"]

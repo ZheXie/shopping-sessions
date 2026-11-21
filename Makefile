@@ -13,9 +13,9 @@ export IMAGE CPUS MEM PLATFORM
 build:
 	docker buildx build --platform $(PLATFORM) --load -t $(IMAGE) .
 
-## Native release binary for local loops
+## Release binary for local loops (flags in rust-pipeline/.cargo/config.toml)
 build-local:
-	cd rust-pipeline && RUSTFLAGS="-C target-cpu=native" cargo build --release
+	cd rust-pipeline && cargo build --release
 
 ## Run all 36 fixtures against the local binary
 fixtures: build-local

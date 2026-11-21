@@ -2,7 +2,7 @@
 FROM rust:1-bookworm AS builder
 WORKDIR /src
 ENV CARGO_TERM_COLOR=never \
-    RUSTFLAGS="-C target-cpu=native"
+    RUSTFLAGS="-C target-cpu=x86-64-v3"
 COPY rust-pipeline/ ./
 RUN cargo build --release && strip -s target/release/shopping-sessions
 

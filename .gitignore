@@ -23,3 +23,4 @@ build/
 
 # Rust build
 rust/target/
+!rust/.cargo/

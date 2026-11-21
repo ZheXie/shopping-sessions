@@ -114,22 +114,54 @@ pub struct EventReader {
 }
 
 impl EventReader {
-    pub fn read(&mut self, path: &Path, buf: Buf, start: usize, len: usize) -> *const u8 {
+    /// Reads the whole lines that start in `[a, b)` of the file (the header,
+    /// the line at offset 0, is skipped) without touching the file mapping.
+    /// Returns (bytes, file offset of the first line, length); `SLACK`
+    /// readable bytes follow. Same lines as `line_start(a)..line_start(b)`.
+    pub fn read_lines(&mut self, path: &Path, buf: Buf, a: usize, b: usize) -> (*const u8, usize, usize) {
+        const EXTRA: usize = 16 << 10;
         let id = buf.ptr as usize;
         if self.file.as_ref().map(|(key, _)| *key) != Some(id) {
             let f = File::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
             self.file = Some((id, f));
         }
-        if self.bytes.len() < len + SLACK {
-            self.bytes.resize(len + SLACK, 0);
+        let lo = a.saturating_sub(1);
+        let mut hi = (b + EXTRA).min(buf.len);
+        loop {
+            let n = hi - lo;
+            if self.bytes.len() < n + SLACK {
+                self.bytes.resize(n + SLACK, 0);
+            }
+            self.file
+                .as_ref()
+                .unwrap()
+                .1
+                .read_exact_at(&mut self.bytes[..n], lo as u64)
+                .unwrap_or_else(|e| panic!("read {} at {lo}: {e}", path.display()));
+            let data = &self.bytes[..n];
+            // First line start at or after a: just past the first '\n' at or after a - 1.
+            let start = match data.iter().position(|&c| c == b'\n') {
+                Some(i) => lo + i + 1,
+                None if hi == buf.len => return (self.bytes.as_ptr(), buf.len, 0),
+                None => {
+                    hi = (hi + (hi - lo)).min(buf.len);
+                    continue;
+                }
+            };
+            let from = b.saturating_sub(1).max(lo) - lo;
+            let end = match data[from..].iter().position(|&c| c == b'\n') {
+                Some(i) => (lo + from + i + 1).min(buf.len),
+                None if hi == buf.len => buf.len,
+                None => {
+                    hi = (hi + (hi - lo)).min(buf.len);
+                    continue;
+                }
+            };
+            if end <= start {
+                return (self.bytes.as_ptr(), start, 0);
+            }
+            return (unsafe { self.bytes.as_ptr().add(start - lo) }, start, end - start);
         }
-        self.file
-            .as_ref()
-            .unwrap()
-            .1
-            .read_exact_at(&mut self.bytes[..len], start as u64)
-            .unwrap_or_else(|e| panic!("read {} at {start}: {e}", path.display()));
-        self.bytes.as_ptr()
     }
 }
 
@@ -349,6 +381,105 @@ impl<T: Copy> PartWriter<T> {
             }
         }
         self.blocks
+    }
+}
+
+/// Global allocator: blocks of `BIG` bytes or more get their own 2 MB aligned
+/// mapping with huge pages requested, and grow by `mremap`, which moves page
+/// tables instead of copying bytes. glibc would place these growing vectors
+/// (edge lists, per-worker output columns, aggregation scratch) in 4 KB pages
+/// and copy them on every doubling: most of the page faults that were left.
+/// Smaller blocks go to the system allocator.
+pub struct HugeAlloc;
+
+const BIG: usize = 1 << 20;
+const HUGE: usize = 2 << 20;
+
+#[inline(always)]
+fn big_len(size: usize) -> usize {
+    (size + HUGE - 1) & !(HUGE - 1)
+}
+
+unsafe fn big_map(size: usize) -> *mut u8 {
+    let len = big_len(size);
+    // Over-map by one huge page, then trim so the block is 2 MB aligned.
+    let p = libc::mmap(
+        null_mut(),
+        len + HUGE,
+        libc::PROT_READ | libc::PROT_WRITE,
+        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+        -1,
+        0,
+    );
+    if p == libc::MAP_FAILED {
+        return null_mut();
+    }
+    let start = p as usize;
+    let aligned = (start + HUGE - 1) & !(HUGE - 1);
+    if aligned > start {
+        libc::munmap(p, aligned - start);
+    }
+    let tail = start + len + HUGE - (aligned + len);
+    if tail > 0 {
+        libc::munmap((aligned + len) as *mut libc::c_void, tail);
+    }
+    libc::madvise(aligned as *mut libc::c_void, len, libc::MADV_HUGEPAGE);
+    aligned as *mut u8
+}
+
+unsafe impl std::alloc::GlobalAlloc for HugeAlloc {
+    #[inline]
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.size() >= BIG && layout.align() <= HUGE {
+            big_map(layout.size())
+        } else {
+            std::alloc::System.alloc(layout)
+        }
+    }
+    #[inline]
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        if layout.size() >= BIG && layout.align() <= HUGE {
+            big_map(layout.size()) // fresh anonymous memory is zero
+        } else {
+            std::alloc::System.alloc_zeroed(layout)
+        }
+    }
+    #[inline]
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        if layout.size() >= BIG && layout.align() <= HUGE {
+            libc::munmap(ptr as *mut libc::c_void, big_len(layout.size()));
+        } else {
+            std::alloc::System.dealloc(ptr, layout)
+        }
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let align = layout.align();
+        let old_big = layout.size() >= BIG && align <= HUGE;
+        let new_big = new_size >= BIG && align <= HUGE;
+        match (old_big, new_big) {
+            (false, false) => std::alloc::System.realloc(ptr, layout, new_size),
+            (true, true) => {
+                let (old_len, new_len) = (big_len(layout.size()), big_len(new_size));
+                if old_len == new_len {
+                    return ptr;
+                }
+                let p = libc::mremap(ptr as *mut libc::c_void, old_len, new_len, libc::MREMAP_MAYMOVE);
+                if p == libc::MAP_FAILED {
+                    return null_mut();
+                }
+                libc::madvise(p, new_len, libc::MADV_HUGEPAGE);
+                p as *mut u8
+            }
+            _ => {
+                let new_layout = std::alloc::Layout::from_size_align_unchecked(new_size, align);
+                let p = self.alloc(new_layout);
+                if !p.is_null() {
+                    std::ptr::copy_nonoverlapping(ptr, p, layout.size().min(new_size));
+                    self.dealloc(ptr, layout);
+                }
+                p
+            }
+        }
     }
 }
 

@@ -37,6 +37,43 @@ daemon was unavailable on this host. Official hidden-set timing is pending.
   outside the inline range. The earliest copy still wins across centuries.
 - The Python reference remains in `pipeline/pipeline.py`.
 
+### Memory traffic round (after `d24a0b7`)
+
+The scorer is 8 vCPUs on 4 Cascade Lake cores, so these timings pin the run to
+four cores (`taskset -c 0-3`, 8 workers). Each figure is the minimum and median
+of 9 alternating runs on 20M events + 5M clicks (seed 11), with the PGO build.
+
+| Setup | `d24a0b7` | This round |
+| --- | ---: | ---: |
+| 4 cores, transparent huge pages | 561 / 577 ms | **488 / 506 ms** |
+| 8 cores | 321 / 325 ms | **281 / 293 ms** |
+| 4 cores, huge pages disabled (`prctl`) | 787 / 807 ms | 780 / 819 ms |
+
+Page faults per run fell from 61k to about 11k, and peak RSS from 1.35 to
+1.16 GB.
+
+- A global allocator gives every block of 1 MB or more its own 2 MB aligned,
+  huge-page mapping and grows it with `mremap`. glibc had placed the growing
+  vectors (edge lists, output columns, aggregation scratch) in 4 KB pages
+  and copied them on every doubling.
+- Click files are read with `pread` like event files instead of being mapped
+  and populated. Line boundaries come from the read buffer, so the mappings
+  are no longer touched on the normal path.
+- Each click carries its click ID as an exact, order-preserving key: 1-10
+  characters of `[0-9A-Za-z]`, 6 bits each. Same-millisecond tie-breaks
+  compare keys and no longer fault in 64 KB of the click file per comparison.
+- Output columns are sized up front from the number of live events.
+
+Checks: 36/36 fixtures (automatic dispatch, AVX2 forced, one worker),
+`scripts/test_regressions.py`, the dev answer, the reference on six more seeds
+up to 5M events, 600 differential fuzz runs, and output identical to
+`d24a0b7` on 40M events (4,405,638 user rows, 28,014 campaign rows).
+
+Tried and dropped (no gain or slower): AVX-512 codegen (`cascadelake`),
+partitions of 25k-200k rows, 1-4 MB tasks, other lookup batch and scan block
+sizes, PGO trained on 5M events, a dedup table at load 3/4, and a person table
+sized for people.
+
 ## Build and check
 
 The release target is Linux x86-64-v3. The container builds the scorer binary

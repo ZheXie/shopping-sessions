@@ -35,6 +35,9 @@ use pq::{bytes_of, Col, Kind};
 use scan::Scan;
 use sys::{par_map, Arena, Blk, Buf, PartWriter, Slab};
 
+#[global_allocator]
+static ALLOC: sys::HugeAlloc = sys::HugeAlloc;
+
 const DAY: u64 = 86_400_000;
 const WEEK: u64 = 7 * DAY;
 const GAP: u64 = 1_800_000;
@@ -64,13 +67,69 @@ struct Pay {
 }
 
 /// A valid click. `cp` is the address of the click id with the campaign index
-/// on top; `t` is `ts - (window_start - 7 days)`.
+/// on top; `t` is `ts - (window_start - 7 days)`; `key` is the click id as an
+/// order-preserving key (see `click_key`), 0 when it does not fit one.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Clk {
     name: Name,
     cp: u64,
     t: u64,
+    key: u64,
+}
+
+/// A click id of 1 to 10 bytes of `[0-9A-Za-z]` as one exact key whose
+/// integer order is the ids' byte order: each byte is a 6-bit symbol 1..=62
+/// in ASCII order ('0'..'9', 'A'..'Z', 'a'..'z'), first byte most
+/// significant, missing bytes 0 (below every symbol, so a prefix sorts
+/// first). Anything else is 0 and compares by its bytes. Tie-breaks between
+/// clicks at the same millisecond then never read the input mapping.
+/// `p` has 16 readable bytes.
+#[inline(always)]
+unsafe fn click_key(p: *const u8, n: usize) -> u64 {
+    use std::arch::x86_64::*;
+    if n == 0 || n > 10 {
+        return 0;
+    }
+    let v = _mm_loadu_si128(p.cast());
+    let live = _mm_cmpgt_epi8(
+        _mm_set1_epi8(n as i8),
+        _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15),
+    );
+    let d = _mm_sub_epi8(v, _mm_set1_epi8(b'0' as i8));
+    let u = _mm_sub_epi8(v, _mm_set1_epi8(b'A' as i8));
+    let l = _mm_sub_epi8(v, _mm_set1_epi8(b'a' as i8));
+    let isd = _mm_cmpeq_epi8(_mm_min_epu8(d, _mm_set1_epi8(9)), d);
+    let isu = _mm_cmpeq_epi8(_mm_min_epu8(u, _mm_set1_epi8(25)), u);
+    let isl = _mm_cmpeq_epi8(_mm_min_epu8(l, _mm_set1_epi8(25)), l);
+    if _mm_movemask_epi8(_mm_andnot_si128(_mm_or_si128(_mm_or_si128(isd, isu), isl), live)) != 0 {
+        return 0;
+    }
+    let sym = _mm_and_si128(
+        _mm_or_si128(
+            _mm_or_si128(
+                _mm_and_si128(isd, _mm_add_epi8(d, _mm_set1_epi8(1))),
+                _mm_and_si128(isu, _mm_add_epi8(u, _mm_set1_epi8(11))),
+            ),
+            _mm_and_si128(isl, _mm_add_epi8(l, _mm_set1_epi8(37))),
+        ),
+        live,
+    );
+    let t = _mm_maddubs_epi16(sym, _mm_set1_epi16(0x0140)); // s0*64 + s1
+    let q = _mm_madd_epi16(t, _mm_set1_epi32(0x0001_1000)); // 4 symbols in 24 bits
+    let q01 = _mm_cvtsi128_si64(q) as u64;
+    let q2 = _mm_extract_epi32::<2>(q) as u32 as u64;
+    ((q01 & 0xFF_FFFF) << 36) | ((q01 >> 32) << 12) | (q2 >> 12)
+}
+
+/// Click a sorts before click b by click id (both at the same time).
+#[inline(always)]
+unsafe fn click_before(a: &(u64, u64, u64), b: &(u64, u64, u64)) -> bool {
+    if a.2 != 0 && b.2 != 0 {
+        a.2 < b.2
+    } else {
+        id_bytes(a.1 & ADDR) < id_bytes(b.1 & ADDR)
+    }
 }
 
 struct Ctx {
@@ -106,6 +165,7 @@ struct ClStage {
     name: Name,
     cp: u64,
     t: u64,
+    key: u64,
 }
 
 struct Work<'a> {
@@ -439,8 +499,12 @@ unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
     w.nev = 0;
 }
 
+/// `base` holds the row (possibly a reusable read buffer); `source` is the
+/// same row in the file mapping, which lives until exit. Names and click IDs
+/// that are not inline keep `source` addresses, so the read buffer can be
+/// reused; those mapped pages are only touched for the rare long IDs and ties.
 #[inline(always)]
-unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 4]) {
+unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, source: *const u8, f: &[(u32, u32); 4]) {
     let user_len = (f[1].1 - f[1].0) as usize;
     if f[0].0 == f[0].1 || user_len == 0 {
         return;
@@ -459,9 +523,10 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 4
     }
     let up = base.add(f[1].0 as usize);
     let s = w.cl.get_unchecked_mut(w.ncl);
-    s.name = links::name_of(up, user_len);
+    s.name = links::name_at(up, user_len, source.add(f[1].0 as usize));
     s.uh = name_hash(s.name);
-    s.cp = (base.add(f[0].0 as usize) as u64) | ((camp as u64) << 48);
+    s.cp = (source.add(f[0].0 as usize) as u64) | ((camp as u64) << 48);
+    s.key = click_key(base.add(f[0].0 as usize), (f[0].1 - f[0].0) as usize);
     s.t = rel;
     ctx.links.prefetch(s.uh);
     w.ncl += 1;
@@ -483,6 +548,7 @@ unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
                 name,
                 cp: s.cp,
                 t: s.t,
+                key: s.key,
             },
         );
     }
@@ -583,9 +649,9 @@ struct Agg<'a> {
     ev_idx: Vec<u32>,
     ev_w: Vec<u64>,
     ck_idx: Vec<u32>,
-    ck_raw: Vec<(u64, u64)>,
+    ck_raw: Vec<(u64, u64, u64)>,
     evs: Vec<u64>,
-    cks: Vec<(u64, u64)>,
+    cks: Vec<(u64, u64, u64)>,
     cnt: Vec<u32>,
     act: Vec<u32>,
     days: Vec<(u32, u32)>,
@@ -594,7 +660,7 @@ struct Agg<'a> {
 }
 
 impl<'a> Agg<'a> {
-    fn new(ctx: &'a Ctx, dims: &'a Dims, w0: i64, w1: i64) -> Self {
+    fn new(ctx: &'a Ctx, dims: &'a Dims, w0: i64, w1: i64, rows_hint: usize) -> Self {
         let day0 = w0.div_euclid(DAY as i64);
         let ndays = ((w1 - 1).div_euclid(DAY as i64) - day0 + 1).max(1) as usize;
         let ncamp = dims.camp_names.len();
@@ -608,15 +674,22 @@ impl<'a> Agg<'a> {
             day_off: (w0 - day0 * DAY as i64) as u64,
             organic: ncamp,
             out: Out {
-                names: Vec::new(),
-                name_runs: vec![32], // dictionary index width in bits
+                // Sized up front (a generous estimate of this worker's rows):
+                // large blocks come from the huge-page allocator, untouched
+                // capacity costs nothing, and the columns never get copied.
+                names: Vec::with_capacity(rows_hint * 8),
+                name_runs: {
+                    let mut v = Vec::with_capacity(rows_hint * 4);
+                    v.push(32); // dictionary index width in bits
+                    v
+                },
                 people: 0,
-                day: Vec::new(),
-                sessions: Vec::new(),
-                events: Vec::new(),
-                revenue: Vec::new(),
-                top_def: Vec::new(),
-                top: Vec::new(),
+                day: Vec::with_capacity(rows_hint),
+                sessions: Vec::with_capacity(rows_hint),
+                events: Vec::with_capacity(rows_hint),
+                revenue: Vec::with_capacity(rows_hint),
+                top_def: Vec::with_capacity(rows_hint / 8 + 1),
+                top: Vec::with_capacity(rows_hint * 4),
                 rows: 0,
                 camp: vec![[0; 4]; (ncamp + 1) * ndays],
             },
@@ -708,7 +781,7 @@ impl<'a> Agg<'a> {
                     if same_name(*self.names.get_unchecked(s as usize - 1), name) {
                         *self.ck_end.get_unchecked_mut(s as usize - 1) += 1;
                         self.ck_idx.push(s - 1);
-                        self.ck_raw.push((c.t, c.cp));
+                        self.ck_raw.push((c.t, c.cp, c.key));
                         break;
                     }
                     slot = (slot + 1) & mask;
@@ -741,7 +814,7 @@ impl<'a> Agg<'a> {
         }
         let nck = self.ck_raw.len();
         if self.cks.len() < nck {
-            self.cks.resize(nck, (0, 0));
+            self.cks.resize(nck, (0, 0, 0));
         }
         for i in 0..nck {
             let at = self
@@ -911,7 +984,7 @@ impl<'a> Agg<'a> {
                 let mut j = best;
                 while j > lo && (*ck.add(j - 1)).0 == t {
                     j -= 1;
-                    if id_bytes((*ck.add(j)).1 & ADDR) < id_bytes((*ck.add(best)).1 & ADDR) {
+                    if click_before(&*ck.add(j), &*ck.add(best)) {
                         best = j;
                     }
                 }
@@ -1158,9 +1231,13 @@ fn main() {
             tasks.push((*buf, a, b, Some(path)));
         }
     }
-    for &(_, buf) in &click_files {
+    // Clicks come second (`Some(path)` with is_click) and are read like
+    // events: a pread into a reusable buffer avoids installing, then tearing
+    // down, a page-table entry for every page of the click files.
+    let n_event_tasks = tasks.len();
+    for (path, buf) in &click_files {
         for (a, b) in chunks(buf.len, chunk) {
-            tasks.push((buf, a, b, None));
+            tasks.push((*buf, a, b, Some(path)));
         }
     }
     let next = AtomicUsize::new(0);
@@ -1181,6 +1258,7 @@ fn main() {
             name: 0,
             cp: 0,
             t: 0,
+            key: 0,
         };
         let mut w = Work {
             slab: Slab::new(&ctx.arena),
@@ -1194,41 +1272,48 @@ fn main() {
             dates: ts::Dates::new(),
         };
         loop {
-            let Some(&(buf, a, b, event_path)) = tasks.get(next.fetch_add(1, Relaxed)) else {
+            let task = next.fetch_add(1, Relaxed);
+            let Some(&(buf, a, b, path)) = tasks.get(task) else {
                 break;
             };
+            let is_click = task >= n_event_tasks;
             unsafe {
-                if let Some(path) = event_path {
+                let path = path.unwrap();
+                // Large files: line boundaries are found in the read buffer,
+                // so the mapping is not touched (no faults, no page-table
+                // entries to tear down at exit).
+                let (input, start, len) = if buffered && buf.can_pread && buf.len >= 256 << 10 {
+                    reader.read_lines(path, buf, a, b)
+                } else {
                     let start = scan::line_start(buf.ptr, buf.len, a);
                     let end = scan::line_start(buf.ptr, buf.len, b);
-                    let len = end - start;
-                    if len == 0 {
-                        continue;
-                    }
-                    let source = buf.ptr.add(start);
-                    let input = if buffered && buf.can_pread && buf.len >= 256 << 10 {
-                        reader.read(path, buf, start, len)
+                    sys::populate(buf.ptr.add(start), end - start);
+                    (buf.ptr.add(start), start, end - start)
+                };
+                if len == 0 {
+                    continue;
+                }
+                let source = buf.ptr.add(start);
+                let mut pos = 0;
+                while pos < len {
+                    let next = sc.scan(input, len, pos, (pos + sub).min(len));
+                    let base = input.add(pos);
+                    let mapped = source.add(pos);
+                    if is_click {
+                        scan::rows::<4, _>(&sc, len - pos, |fields| {
+                            click_row(&ctx, &mut w, base, mapped, fields)
+                        });
                     } else {
-                        sys::populate(source, len);
-                        source
-                    };
-                    let mut pos = 0;
-                    while pos < len {
-                        let next = sc.scan(input, len, pos, (pos + sub).min(len));
-                        let base = input.add(pos);
-                        let mapped = source.add(pos);
                         scan::rows::<7, _>(&sc, len - pos, |fields| {
                             event_row(&ctx, &mut w, base, mapped, fields)
                         });
-                        pos = next;
                     }
-                    flush_events(&ctx, &mut w);
-                } else {
-                    sys::populate(buf.ptr.add(a), b - a);
-                    for_rows::<4, _>(&mut sc, buf, a, b, sub, |base, f| {
-                        click_row(&ctx, &mut w, base, f)
-                    });
+                    pos = next;
+                }
+                if is_click {
                     flush_clicks(&ctx, &mut w);
+                } else {
+                    flush_events(&ctx, &mut w);
                 }
             }
         }
@@ -1262,9 +1347,12 @@ fn main() {
     // overlaps the other workers' ordinary partitions.
     let mut order: Vec<usize> = (0..person_parts).collect();
     order.sort_unstable_by_key(|&p| std::cmp::Reverse(pays[p].len() + clks[p].len()));
+    // About one user_daily row per 9 live events; twice that, per worker.
+    let live_events: usize = pays.iter().flatten().map(|b| b.n as usize).sum();
+    let rows_hint = live_events / 4 / threads + 4096;
     let next = AtomicUsize::new(0);
     let outs = par_map(threads, |t| {
-        let mut agg = std::mem::ManuallyDrop::new(Agg::new(&ctx, &dims, w0, w1));
+        let mut agg = std::mem::ManuallyDrop::new(Agg::new(&ctx, &dims, w0, w1, rows_hint));
         loop {
             let Some(&part) = order.get(next.fetch_add(1, Relaxed)) else {
                 break;

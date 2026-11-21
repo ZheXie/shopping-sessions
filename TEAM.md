@@ -2,4 +2,4 @@
 
 Name:
 Members:
-Engine: Polars → Rust (planned)
+Engine: Python correctness baseline (custom CSV) → Rust speed (planned)

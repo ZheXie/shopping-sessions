@@ -8,7 +8,11 @@ Exact ETL for dirty click-stream logs → two daily Parquet tables. Fastest corr
 
 ## Status
 
-Scaffolded from the official Polars starter. Tables currently write with the correct schema but **no rows** until the pipeline is implemented. Follow the phase plan in `IMPLEMENTATION_PLAN.md`.
+**Correctness baseline is green:**
+- 36/36 fixtures pass
+- `make check-dev` / seed-1 1M-event set: **exact MATCH** (~23s in this environment, pure Python parse)
+
+Next: speed (Rust / parallel parse) toward sub-2s practice times. See `IMPLEMENTATION_PLAN.md`.
 
 ## Quick start
 

@@ -1,5 +1,6 @@
 //! Memory mapping, a bump slab backed by huge pages, partition writers, threads.
 
+use std::arch::x86_64::{__m256i, _mm256_load_si256, _mm256_stream_si256, _mm_sfence};
 use std::fs::File;
 use std::marker::PhantomData;
 use std::os::unix::io::AsRawFd;
@@ -40,6 +41,7 @@ pub fn map_file(path: &Path) -> Buf {
         return Buf { ptr: EMPTY.as_ptr(), len: 0 };
     }
     unsafe {
+        let pop = if std::env::var("SS_POP").is_ok() { libc::MAP_POPULATE } else { 0 };
         // Reserve one zero page past the file so the slack is always readable.
         let span = ((len + PAGE - 1) & !(PAGE - 1)) + PAGE;
         let base = libc::mmap(
@@ -53,7 +55,7 @@ pub fn map_file(path: &Path) -> Buf {
         let p = if base == libc::MAP_FAILED {
             libc::MAP_FAILED
         } else {
-            libc::mmap(base, len, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_FIXED, f.as_raw_fd(), 0)
+            libc::mmap(base, len, libc::PROT_READ, libc::MAP_PRIVATE | libc::MAP_FIXED | pop, f.as_raw_fd(), 0)
         };
         if p == libc::MAP_FAILED {
             let v = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
@@ -122,6 +124,17 @@ impl Slab {
     }
 }
 
+/// Maps the file pages behind `[ptr, ptr + len)` in one call, which is cheaper
+/// than faulting them in one by one. Best effort.
+pub fn populate(ptr: *const u8, len: usize) {
+    const MADV_POPULATE_READ: libc::c_int = 22;
+    let from = ptr as usize & !(PAGE - 1);
+    let to = (ptr as usize + len + PAGE - 1) & !(PAGE - 1);
+    unsafe {
+        libc::madvise(from as *mut libc::c_void, to - from, MADV_POPULATE_READ);
+    }
+}
+
 /// A run of `n` records at `ptr`.
 #[derive(Clone, Copy)]
 pub struct Blk {
@@ -129,65 +142,105 @@ pub struct Blk {
     pub n: u32,
 }
 
-/// Appends records to one of `parts` partitions, in fixed-size blocks carved
-/// from a slab. Records never move, so pointers to them stay valid.
+#[derive(Clone, Copy)]
+struct Head {
+    /// Where the staged records will land.
+    dst: usize,
+    /// End of the current block.
+    end: usize,
+    /// Start of the current block; 0 before the first.
+    start: usize,
+    /// Bytes staged.
+    fill: usize,
+}
+
+const BLOCK_BYTES: usize = 6144;
+
+/// Appends records to one of `parts` partitions. Records are staged in a
+/// small per-partition buffer and moved to their block with non-temporal
+/// stores a few cache lines at a time, so the scatter touches few pages and
+/// never reads its destination. A record's final address is known when it is
+/// pushed and never changes.
 pub struct PartWriter<T> {
-    cur: Vec<(usize, usize)>,
-    start: Vec<usize>,
+    heads: Vec<Head>,
+    stage: *mut u8,
+    /// Staging bytes per partition: a multiple of both 64 and the record size.
+    wc: usize,
     done: Vec<Vec<Blk>>,
-    block_bytes: usize,
     _marker: PhantomData<T>,
 }
 
 impl<T: Copy> PartWriter<T> {
-    pub fn new(parts: usize, records_per_block: usize) -> Self {
+    pub fn new(parts: usize) -> Self {
+        let size = std::mem::size_of::<T>();
+        let mut wc = 64;
+        while wc % size != 0 {
+            wc += 64;
+        }
+        assert!(BLOCK_BYTES % wc == 0);
         PartWriter {
-            cur: vec![(0, 0); parts],
-            start: vec![0; parts],
+            heads: vec![Head { dst: 0, end: 0, start: 0, fill: 0 }; parts],
+            stage: anon(parts * wc),
+            wc,
             done: (0..parts).map(|_| Vec::new()).collect(),
-            block_bytes: records_per_block * std::mem::size_of::<T>(),
             _marker: PhantomData,
         }
     }
 
+    /// Returns the address the record will have once it is flushed.
     #[inline(always)]
     pub unsafe fn push(&mut self, part: usize, slab: &mut Slab, value: T) -> usize {
-        if {
-            let c = self.cur.get_unchecked(part);
-            c.0 == c.1
-        } {
+        let wc = self.wc;
+        let mut h = *self.heads.get_unchecked(part);
+        if h.dst == h.end {
             self.refill(part, slab);
+            h = *self.heads.get_unchecked(part);
         }
-        let c = self.cur.get_unchecked_mut(part);
-        let dst = c.0;
-        (dst as *mut T).write_unaligned(value);
-        c.0 = dst + std::mem::size_of::<T>();
-        dst
+        let stage = self.stage.add(part * wc);
+        (stage.add(h.fill) as *mut T).write_unaligned(value);
+        let addr = h.dst + h.fill;
+        h.fill += std::mem::size_of::<T>();
+        if h.fill == wc {
+            let mut i = 0;
+            while i < wc {
+                let v = _mm256_load_si256(stage.add(i) as *const __m256i);
+                _mm256_stream_si256((h.dst + i) as *mut __m256i, v);
+                i += 32;
+            }
+            h.dst += wc;
+            h.fill = 0;
+        }
+        *self.heads.get_unchecked_mut(part) = h;
+        addr
     }
 
     #[cold]
     #[inline(never)]
     fn refill(&mut self, part: usize, slab: &mut Slab) {
         self.close(part);
-        let bytes = (self.block_bytes + 15) & !15;
-        let b = slab.alloc(bytes);
-        self.start[part] = b;
-        self.cur[part] = (b, b + self.block_bytes);
+        let b = slab.alloc(BLOCK_BYTES);
+        self.heads[part] = Head { dst: b, end: b + BLOCK_BYTES, start: b, fill: 0 };
     }
 
     fn close(&mut self, part: usize) {
-        let start = self.start[part];
-        let cur = self.cur[part].0;
-        if start != 0 && cur > start {
-            let n = ((cur - start) / std::mem::size_of::<T>()) as u32;
-            self.done[part].push(Blk { ptr: start, n });
+        let h = self.heads[part];
+        if h.start == 0 {
+            return;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.stage.add(part * self.wc), h.dst as *mut u8, h.fill);
+        }
+        let n = (h.dst + h.fill - h.start) / std::mem::size_of::<T>();
+        if n > 0 {
+            self.done[part].push(Blk { ptr: h.start, n: n as u32 });
         }
     }
 
     pub fn finish(mut self) -> Vec<Vec<Blk>> {
-        for part in 0..self.cur.len() {
+        for part in 0..self.heads.len() {
             self.close(part);
         }
+        unsafe { _mm_sfence() };
         self.done
     }
 }

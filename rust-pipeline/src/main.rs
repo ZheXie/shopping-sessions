@@ -41,7 +41,6 @@ const PTR_MASK: u64 = (1 << 48) - 1;
 const DEAD: u64 = 1 << 63;
 const PART_SHIFT: u32 = 44;
 const MAX_PARTS: usize = 4096;
-const BLOCK_RECORDS: usize = 256;
 const BATCH: usize = 32;
 const NONE: u32 = u32::MAX;
 
@@ -1038,6 +1037,8 @@ fn main() {
             tasks.push((buf, a, b, false));
         }
     }
+    let mode = env_usize("SS_MODE").unwrap_or(0);
+    let populate = env_usize("SS_POPULATE").unwrap_or(1) != 0;
     let next = AtomicUsize::new(0);
     let scattered = par_map(threads, |_| {
         let mut sc = Scan::new();
@@ -1045,9 +1046,9 @@ fn main() {
         let blank_cl = ClStage { uh: 0, up: 0, cp: 0, t: 0 };
         let mut w = Work {
             slab: Slab::new(),
-            keys: PartWriter::new(ev_parts, BLOCK_RECORDS),
-            pays: PartWriter::new(person_parts, BLOCK_RECORDS),
-            clks: PartWriter::new(person_parts, BLOCK_RECORDS),
+            keys: PartWriter::new(ev_parts),
+            pays: PartWriter::new(person_parts),
+            clks: PartWriter::new(person_parts),
             ev: [blank_ev; BATCH],
             nev: 0,
             cl: [blank_cl; BATCH],
@@ -1057,7 +1058,27 @@ fn main() {
             let Some(&(buf, a, b, is_events)) = tasks.get(next.fetch_add(1, Relaxed)) else {
                 break;
             };
+            if populate {
+                sys::populate(unsafe { buf.ptr.add(a) }, b - a);
+            }
             unsafe {
+                if mode == 1 {
+                    let mut pos = scan::line_start(buf.ptr, buf.len, a);
+                    while pos < b { pos = sc.scan(buf.ptr, buf.len, pos, (pos + sub).min(b)); }
+                    continue;
+                }
+                if mode == 2 {
+                    let mut x = 0u64;
+                    if is_events { for_rows::<7, _>(&mut sc, buf, a, b, sub, |_, f| x += f[0].0 as u64); }
+                    else { for_rows::<4, _>(&mut sc, buf, a, b, sub, |_, f| x += f[0].0 as u64); }
+                    std::hint::black_box(x);
+                    continue;
+                }
+                if mode == 3 {
+                    if is_events { for_rows::<7, _>(&mut sc, buf, a, b, sub, |base, f| { event_row(&ctx, &mut w, base, f); if w.nev == BATCH - 1 { w.nev = 0; } }); }
+                    else { for_rows::<4, _>(&mut sc, buf, a, b, sub, |base, f| { click_row(&ctx, &mut w, base, f); if w.ncl == BATCH - 1 { w.ncl = 0; } }); }
+                    continue;
+                }
                 if is_events {
                     for_rows::<7, _>(&mut sc, buf, a, b, sub, |base, f| event_row(&ctx, &mut w, base, f));
                     flush_events(&ctx, &mut w);
@@ -1127,6 +1148,11 @@ fn main() {
     lap("campaigns");
     if timing {
         eprintln!("{:>10} {:>8.1} ms", "total", started.elapsed().as_secs_f64() * 1e3);
+        if let Ok(roll) = fs::read_to_string("/proc/self/smaps_rollup") {
+            for line in roll.lines().filter(|l| l.starts_with("Rss") || l.starts_with("AnonHuge") || l.starts_with("Anonymous")) {
+                eprintln!("  {line}");
+            }
+        }
     }
     eprintln!("wrote user_daily={user_rows} campaign_daily={camp_rows} threads={threads}");
     // Everything still mapped is reclaimed faster by the kernel than by us.

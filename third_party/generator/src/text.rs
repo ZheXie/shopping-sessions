@@ -211,24 +211,24 @@ fn mix64(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// Like the scorer's v5 IDs: a keyed bijection on 40 bits in base 36, and a
-/// 32-character hex suffix on one in eight distinct values. Only the profile
-/// build reads these, so the exact keyed mix does not need to match.
+/// Like the scorer's v5 IDs: a keyed bijection on 40 bits, then either 32
+/// lowercase hex digits (one in eight distinct values) or base 36. Only the
+/// profile build reads these, so the exact keyed mix does not need to match.
 pub fn opaque(out: &mut Vec<u8>, value: u64, key: u64) {
     const MASK: u64 = (1 << 40) - 1;
     let mut m = scramble(value, key);
     m = (m.wrapping_mul(mix64(key) | 1)) & MASK;
     m ^= m >> 19;
     m = (m ^ (mix64(key ^ 7) & MASK)).wrapping_mul(0x5851_F42D_4C95_7F2D) & MASK;
-    base36(out, m);
-    let h = mix64(value ^ key.rotate_left(17));
-    if h % 8 == 0 {
+    if m % 8 == 0 {
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        for word in [mix64(h ^ 1), mix64(h ^ 2)] {
+        for word in [mix64(m ^ key), mix64(m ^ key.rotate_left(29) ^ 1)] {
             for i in (0..16).rev() {
                 out.push(HEX[((word >> (i * 4)) & 15) as usize]);
             }
         }
+    } else {
+        base36(out, m);
     }
 }
 

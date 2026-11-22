@@ -1462,7 +1462,11 @@ fn main() {
     // Small enough that a read buffer stays in the L2 two hyperthreads share.
     let chunk = env_usize("SS_CHUNK").unwrap_or(256 << 10).max(4096);
     let sub = env_usize("SS_SUB").unwrap_or(96 << 10).max(64);
+    // SS_READ=mmap parses the file mapping in place instead of pread copies;
+    // SS_REL=1 then drops each task's pages once it is flushed. Which is
+    // faster depends on the host's page-fault and copy costs.
     let buffered = std::env::var("SS_READ").as_deref() != Ok("mmap");
+    let release = !buffered && std::env::var("SS_REL").as_deref() == Ok("1");
     let mut tasks: Vec<(Buf, usize, usize, &Path)> = Vec::new();
     for (path, buf) in &event_files {
         for (a, b) in chunks(buf.len, chunk) {
@@ -1553,6 +1557,13 @@ fn main() {
                     flush_clicks(&ctx, &mut w);
                 } else {
                     flush_events(&ctx, &mut w);
+                }
+                if release {
+                    // Nothing keeps a pointer into the mapping once a task
+                    // is flushed (long IDs that escape are copied), so its
+                    // whole pages go now: page tables stay small and exit
+                    // has nothing left to tear down.
+                    sys::release(input, len);
                 }
             }
         }

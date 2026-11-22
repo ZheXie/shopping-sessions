@@ -336,6 +336,17 @@ pub unsafe fn stable_id(slab: &mut Slab, p: *const u8, len: usize) -> *const u8 
     dst
 }
 
+/// Drops the page-table entries of the whole pages inside `[ptr, ptr + len)`
+/// of a private file mapping. The page cache keeps the data, so a later read
+/// (a line that straddles the boundary) simply faults the page back in.
+pub fn release(ptr: *const u8, len: usize) {
+    let from = (ptr as usize).next_multiple_of(PAGE);
+    let to = (ptr as usize + len) & !(PAGE - 1);
+    if to > from {
+        unsafe { libc::madvise(from as *mut libc::c_void, to - from, libc::MADV_DONTNEED) };
+    }
+}
+
 /// Backs `[ptr, ptr + len)` with zeroed memory now. A region first touched by
 /// a read is mapped to the shared zero page and then never gets huge pages;
 /// writing it first does.

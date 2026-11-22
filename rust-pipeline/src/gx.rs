@@ -282,79 +282,93 @@ fn solve(pairs: &[(u64, u64)], d: u64, start: u32, check: impl Fn(u64) -> bool) 
     (found.len() == 1).then(|| found[0])
 }
 
-/// Recovers both keys from a sample of the input. `None` sends the run to
-/// the general pipeline.
-pub fn infer(data: &Path, event_files: &[(PathBuf, Buf)], timing: bool) -> Option<Keys> {
-    let started = Instant::now();
+/// Event key from pairs of one user's events within 30 minutes: they are a
+/// few indexes apart. Samples the start of the largest files, 3 MB first
+/// and more only when that yields too few pairs. Returns the key and the
+/// index bound.
+fn infer_events(event_files: &[(PathBuf, Buf)]) -> (Option<u64>, u64, usize) {
     let mut sc = Scan::new();
     let mut dates = ts::Dates::new();
-
-    // Events: pairs within a session of a lightly sampled user are a few
-    // indexes apart.
     let mut files: Vec<&Buf> = event_files.iter().map(|(_, b)| b).collect();
     files.sort_by_key(|b| std::cmp::Reverse(b.len));
     files.truncate(8);
-    let budget = (6 << 20) / files.len().max(1);
+    let per = |total: usize| total / files.len().max(1);
     // (user ID hash, ts, ID value): sorting groups each user's rows in time
     // order without a map entry per user.
     let mut by_user: Vec<(u64, i64, u64)> = Vec::new();
     let mut event_xs: Vec<u64> = Vec::new();
     let (mut rows, mut bytes) = (0usize, 0usize);
-    for buf in &files {
-        let end = buf.len.min(budget);
-        bytes += end;
-        unsafe {
-            for_rows::<7, _>(&mut sc, **buf, 0, end, 1 << 16, |base, f| {
-                rows += 1;
-                let id = base.add(f[0].0 as usize);
-                let v = id_value(id, (f[0].1 - f[0].0) as usize, b'e');
-                if v > MASK40 {
-                    return;
+    let mut pairs = Vec::new();
+    let mut from = 0usize;
+    for round in [3usize << 20, 8 << 20] {
+        let to = per(round);
+        for buf in &files {
+            let (a, b) = (from.min(buf.len), to.min(buf.len));
+            if a >= b {
+                continue;
+            }
+            bytes += b - a;
+            unsafe {
+                for_rows::<7, _>(&mut sc, **buf, a, b, 1 << 16, |base, f| {
+                    rows += 1;
+                    let id = base.add(f[0].0 as usize);
+                    let v = id_value(id, (f[0].1 - f[0].0) as usize, b'e');
+                    if v > MASK40 {
+                        return;
+                    }
+                    let x = outer(v);
+                    if event_xs.len() < 4096 {
+                        event_xs.push(x);
+                    }
+                    let user = field(base, f[1]);
+                    let t = dates.parse(base.add(f[2].0 as usize), (f[2].1 - f[2].0) as usize);
+                    if !user.is_empty() && t != ts::BAD {
+                        by_user.push((hash(user.as_ptr(), user.len()), t, x));
+                    }
+                });
+            }
+        }
+        from = to;
+        by_user.sort_unstable();
+        pairs.clear();
+        for list in by_user.chunk_by(|a, b| a.0 == b.0) {
+            if !(2..=4).contains(&list.len()) {
+                continue;
+            }
+            for w in list.windows(2) {
+                if w[1].1 - w[0].1 <= GAP as i64 && w[0].2 != w[1].2 {
+                    pairs.push((w[0].2, w[1].2));
                 }
-                let x = outer(v);
-                if event_xs.len() < 4096 {
-                    event_xs.push(x);
-                }
-                let user = field(base, f[1]);
-                let t = dates.parse(base.add(f[2].0 as usize), (f[2].1 - f[2].0) as usize);
-                if !user.is_empty() && t != ts::BAD {
-                    by_user.push((hash(user.as_ptr(), user.len()), t, x));
-                }
-            });
+            }
+        }
+        if pairs.len() >= 200 {
+            break;
         }
     }
     if rows < 1000 || event_xs.len() < 512 {
-        return None;
+        return (None, 0, pairs.len());
     }
     let total: usize = event_files.iter().map(|(_, b)| b.len).sum();
     let rows_est = (total as f64 * rows as f64 / bytes.max(1) as f64) as u64;
     let nmax = (rows_est + rows_est / 4 + 4096).next_multiple_of(1 << BSHIFT);
-    by_user.sort_unstable();
-    let mut pairs = Vec::new();
-    for list in by_user.chunk_by(|a, b| a.0 == b.0) {
-        if !(2..=4).contains(&list.len()) {
-            continue;
-        }
-        for w in list.windows(2) {
-            if w[1].1 - w[0].1 <= GAP as i64 && w[0].2 != w[1].2 {
-                pairs.push((w[0].2, w[1].2));
-            }
-        }
-    }
-    pairs.truncate(1024);
-    let event = solve(&pairs, 64, 11, |k| {
+    pairs.truncate(256);
+    let key = solve(&pairs, 64, 11, |k| {
         event_xs.iter().filter(|&&x| index_of(x, k) < nmax).count() * 20 >= event_xs.len() * 19
     });
-    let event_pairs = pairs.len();
+    (key, nmax, pairs.len())
+}
 
-    // Users: the two IDs of a link are aliases of one user number.
+/// User key from links: the two IDs of a link are aliases of one user
+/// number.
+fn infer_users(data: &Path) -> (Option<u64>, usize) {
+    let mut sc = Scan::new();
     let mut links: Vec<(PathBuf, Buf)> = crate::list_csvs(&data.join("links"));
     links.sort_by_key(|(_, b)| std::cmp::Reverse(b.len));
     links.truncate(4);
     let mut pairs = Vec::new();
     let mut user_xs = Vec::new();
     for (_, buf) in &links {
-        let end = buf.len.min(1 << 20);
+        let end = buf.len.min(256 << 10);
         unsafe {
             for_rows::<2, _>(&mut sc, *buf, 0, end, 1 << 16, |base, f| {
                 let a = id_value(base.add(f[0].0 as usize), (f[0].1 - f[0].0) as usize, b'u');
@@ -363,25 +377,35 @@ pub fn infer(data: &Path, event_files: &[(PathBuf, Buf)], timing: bool) -> Optio
                     if user_xs.len() < 4096 {
                         user_xs.push(outer(a));
                     }
-                    if pairs.len() < 1024 {
+                    if pairs.len() < 256 {
                         pairs.push((outer(a), outer(b)));
                     }
                 }
             });
         }
     }
-    let user = if user_xs.len() < 512 {
-        None
-    } else {
-        solve(&pairs, 512, 13, |k| {
-            user_xs.iter().filter(|&&x| index_of(x, k) < MAX_N).count() * 20 >= user_xs.len() * 19
-        })
-    };
+    if user_xs.len() < 512 {
+        return (None, pairs.len());
+    }
+    let key = solve(&pairs, 512, 13, |k| {
+        user_xs.iter().filter(|&&x| index_of(x, k) < MAX_N).count() * 20 >= user_xs.len() * 19
+    });
+    (key, pairs.len())
+}
+
+/// Recovers both keys from a sample of the input, the two in parallel.
+/// `None` sends the run to the general pipeline.
+pub fn infer(data: &Path, event_files: &[(PathBuf, Buf)], timing: bool) -> Option<Keys> {
+    let started = Instant::now();
+    let ((event, nmax, event_pairs), (user, link_pairs)) = std::thread::scope(|s| {
+        let users = s.spawn(|| infer_users(data));
+        let events = infer_events(event_files);
+        (events, users.join().unwrap_or((None, 0)))
+    });
     if timing {
         eprintln!(
-            "  gx-infer {:>8.1} ms  event pairs {event_pairs} key {event:?}  link pairs {} key {user:?}  nmax {nmax}",
+            "  gx-infer {:>8.1} ms  event pairs {event_pairs} key {event:?}  link pairs {link_pairs} key {user:?}  nmax {nmax}",
             started.elapsed().as_secs_f64() * 1e3,
-            pairs.len()
         );
     }
     Some(Keys {
@@ -391,18 +415,39 @@ pub fn infer(data: &Path, event_files: &[(PathBuf, Buf)], timing: bool) -> Optio
     })
 }
 
-/// One event row filed under its index.
+/// One event row filed under its index, in two words:
+/// - `w0`: `ts - window_start` in ms (31 bits, all ones for an invalid row)
+///   `<< 33 | price << cat_bits | category` (29 bits) `<< 4 |` alias (4 bits);
+/// - `w1`: slot in the bucket (15 bits) `|` ingest seconds from
+///   `G::ing_base` (21 bits) `<< 15 |` user reference (28 bits) `<< 36`.
+///
+/// A user reference below `SIDE` is the user number, with the alias in `w0`.
+/// Otherwise it names a full user word (an alias of 16 or more, or an
+/// undecodable ID) in the writing thread's side table.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct EvRec {
-    i: u32,
-    /// `ingest_ts` in seconds from `G::origin`.
-    ingest: u32,
-    /// `ts - window_start` in ms, or `NO_TS` for an invalid row.
-    ts: u32,
-    /// `price << cat_bits | category` for a valid purchase, else 0.
-    pc: u32,
-    user: u64,
+    w0: u64,
+    w1: u64,
+}
+
+const W0_INVALID: u64 = u64::MAX;
+const ING_SHIFT: u32 = 15;
+const ING_BITS: u32 = 21;
+const ING_MASK: u64 = (1 << ING_BITS) - 1;
+const USER_SHIFT: u32 = 36;
+const SIDE: u64 = 1 << 27;
+const SIDE_TID: u32 = 23;
+const SIDE_MAX: usize = 1 << SIDE_TID;
+const PC_MASK: u64 = (1 << 29) - 1;
+/// Workers whose index fits a side reference.
+pub const MAX_THREADS: usize = 16;
+
+impl EvRec {
+    #[inline(always)]
+    fn ingest(&self) -> u64 {
+        (self.w1 >> ING_SHIFT) & ING_MASK
+    }
 }
 
 /// A click of a decoded user, filed under the user number.
@@ -436,7 +481,9 @@ struct Win {
 struct G<'a> {
     ctx: &'a Ctx,
     keys: Keys,
-    origin: i64,
+    /// Origin of record ingest offsets, in seconds: four days before the
+    /// window, so 21 bits reach about twenty days past its start.
+    ing_base: i64,
     /// Roots of linked people that are not simple.
     cx_roots: Vec<AtomicU64>,
     /// User numbers with an ID in such a person.
@@ -546,6 +593,10 @@ struct GWork<'a> {
     clicks: PartWriter<ClRec>,
     xclk: PartWriter<Clk>,
     odd: Vec<OddEv>,
+    /// Full user words that do not fit a record.
+    side: Vec<u64>,
+    tid: u64,
+    overflow: bool,
     dates: ts::Dates,
     max_u: u64,
 }
@@ -594,49 +645,60 @@ unsafe fn ev_row(g: &G, w: &mut GWork, base: *const u8, source: *const u8, f: &[
     } else {
         valid = false;
     }
-    let (ts_word, pc, user) = if valid {
-        let mut pc = 0u32;
-        if price != 0 {
-            let c = ctx
-                .products
-                .get(base.add(f[5].0 as usize), (f[5].1 - f[5].0) as usize);
-            let cat = if c == NONE { ctx.unknown } else { c as u64 };
-            pc = ((price << ctx.cat_bits) | cat) as u32;
-        }
-        let up = base.add(f[1].0 as usize);
-        (
-            rel as u32,
-            pc,
-            user_word(g.keys.user, up, user_len, source.add(f[1].0 as usize)),
-        )
-    } else {
-        (NO_TS, 0, 0)
-    };
-    let i = event_index(base.add(b0 as usize), (e0 - b0) as usize, &g.keys);
-    let ing = ingest - g.origin;
-    // An ingest offset of 0 marks a free dedup slot.
-    if i != u64::MAX && (1..u32::MAX as i64).contains(&ing) {
-        w.recs.push(
-            (i >> BSHIFT) as usize,
-            &mut w.slab,
-            EvRec {
-                i: i as u32,
-                ingest: ing as u32,
-                ts: ts_word,
-                pc,
-                user,
-            },
-        );
-    } else {
-        w.odd.push(OddEv {
-            id: source.add(b0 as usize) as usize,
-            len: e0 - b0,
-            ts: ts_word,
-            pc,
-            ingest,
-            user,
-        });
+    let mut pc = 0u32;
+    if valid && price != 0 {
+        let c = ctx
+            .products
+            .get(base.add(f[5].0 as usize), (f[5].1 - f[5].0) as usize);
+        let cat = if c == NONE { ctx.unknown } else { c as u64 };
+        pc = ((price << ctx.cat_bits) | cat) as u32;
     }
+    let up = base.add(f[1].0 as usize);
+    let i = event_index(base.add(b0 as usize), (e0 - b0) as usize, &g.keys);
+    let ing = ingest - g.ing_base;
+    if i != u64::MAX && (0..1 << ING_BITS).contains(&ing) {
+        let (w0, r) = if valid {
+            let n = user_number(up, user_len, g.keys.user);
+            let (r, alias) = if n != u64::MAX && n & 511 < 16 {
+                (n >> 9, n & 15)
+            } else {
+                // A full side table cannot hold the word; the run falls
+                // back (copies of one event must not be split between
+                // the index path and the string path).
+                w.overflow |= w.side.len() >= SIDE_MAX;
+                let word = if n != u64::MAX {
+                    (n << 8) | REG
+                } else {
+                    links::name_at(up, user_len, source.add(f[1].0 as usize))
+                };
+                w.side.push(word);
+                (
+                    SIDE | (w.tid << SIDE_TID)
+                        | ((w.side.len() as u64 - 1) & (SIDE_MAX as u64 - 1)),
+                    0,
+                )
+            };
+            ((rel << 33) | (u64::from(pc) << 4) | alias, r)
+        } else {
+            (W0_INVALID, 0)
+        };
+        let w1 = (i & u64::from(BMASK)) | ((ing as u64) << ING_SHIFT) | (r << USER_SHIFT);
+        w.recs
+            .push((i >> BSHIFT) as usize, &mut w.slab, EvRec { w0, w1 });
+        return;
+    }
+    w.odd.push(OddEv {
+        id: source.add(b0 as usize) as usize,
+        len: e0 - b0,
+        ts: if valid { rel as u32 } else { NO_TS },
+        pc,
+        ingest,
+        user: if valid {
+            user_word(g.keys.user, up, user_len, source.add(f[1].0 as usize))
+        } else {
+            0
+        },
+    });
 }
 
 #[inline(always)]
@@ -830,6 +892,11 @@ pub fn run(
             last = now;
         }
     };
+    // Record layout limits: worker index in a side reference, categories
+    // next to a price in 29 bits, and the window in 31 bits of ms.
+    if threads > MAX_THREADS || ctx.cat_bits > 5 || ctx.wlen >= (1 << 31) - 1 {
+        return None;
+    }
     let links = &ctx.links;
     let cap = links.cap();
     let nb = (keys.nmax >> BSHIFT) as usize;
@@ -904,7 +971,7 @@ pub fn run(
     let g = G {
         ctx,
         keys,
-        origin: ctx.w0.div_euclid(1000) - (1 << 31),
+        ing_base: ctx.w0.div_euclid(1000) - 4 * 86_400,
         cx_roots,
         cx_users,
         users,
@@ -928,7 +995,7 @@ pub fn run(
         }
     }
     let next = AtomicUsize::new(0);
-    let parsed = par_map(threads, |_| {
+    let parsed = par_map(threads, |tid| {
         let mut sc = Scan::new();
         let mut reader = sys::EventReader::default();
         let mut w = GWork {
@@ -937,6 +1004,9 @@ pub fn run(
             clicks: PartWriter::new(ncb),
             xclk: PartWriter::new(XP),
             odd: Vec::new(),
+            side: Vec::new(),
+            tid: tid as u64,
+            overflow: false,
             dates: ts::Dates::new(),
             max_u: 0,
         };
@@ -979,19 +1049,28 @@ pub fn run(
             w.xclk.finish(),
             w.odd,
             w.max_u,
+            w.side,
+            w.overflow,
         )
     });
     let mut recs = Vec::new();
     let mut cks = Vec::new();
     let mut xclk_lists = Vec::new();
     let mut odd: Vec<OddEv> = Vec::new();
+    let mut sides: Vec<Vec<u64>> = Vec::new();
+    let mut overflow = false;
     let mut max_u = 0;
-    for (r, c, x, o, m) in parsed {
+    for (r, c, x, o, m, s, f) in parsed {
         recs.push(r);
         cks.push(c);
         xclk_lists.push(x);
         odd.extend(o);
         max_u = max_u.max(m);
+        sides.push(s);
+        overflow |= f;
+    }
+    if overflow {
+        return None;
     }
     let recs = merge_blocks(recs, nb);
     let cks = merge_blocks(cks, ncb);
@@ -1040,53 +1119,50 @@ pub fn run(
     // Dedup and aggregation run together: each worker takes a range of
     // index buckets, keeps the earliest copy per slot in L2-resident arrays,
     // and aggregates the survivors in index order straight away. A range's
-    // first and last user may continue in a neighbouring range; those runs
-    // are set aside and finished once every range is done.
+    // first and last user may continue in a neighbouring range; their
+    // simple people's events are set aside (complex events go to the general
+    // path at once) and finished afterwards, in one pool with the complex
+    // people, largest work first.
     let nranges = (threads * 16).min(nb).max(1);
     let rows_hint = keys.nmax as usize / 5 / threads + 4096;
-    let groups: Vec<OnceLock<CGroup>> = (0..ncb).map(|_| OnceLock::new()).collect();
-    let (next_c, next_r, next_d, next_x) = (
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-        AtomicUsize::new(0),
-    );
+    let (next_r, next_t) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let barrier = Barrier::new(threads);
     let ranges: Mutex<Vec<(usize, u64, u64, bool, usize)>> = Mutex::new(Vec::new());
     let deferred: Mutex<Vec<Deferred>> = Mutex::new(Vec::new());
-    let plan: OnceLock<(bool, usize, Vec<Deferred>, Vec<(usize, usize)>)> = OnceLock::new();
-    let seen: Vec<AtomicU64> = (0..(MAX_N >> 9) as usize / 64)
-        .map(|_| AtomicU64::new(0))
-        .collect();
     let complex_lists: Mutex<Vec<(Vec<Vec<Blk>>, Vec<Vec<Blk>>)>> = Mutex::new(Vec::new());
+    // (ordered, live events, set-aside runs, tasks): a task is a user's
+    // set-aside runs `(start, end)` or a complex partition `(XP + p, 0)`.
+    type Plan = (bool, usize, Vec<Deferred>, Vec<(usize, usize)>);
+    let plan: OnceLock<Plan> = OnceLock::new();
     let odd_x = Mutex::new(Some(odd_x));
     let outs = par_map(threads, |t| {
         let t0 = Instant::now();
-        let mut marks = [0f64; 4];
+        let mut marks = [0f64; 5];
         let mut agg = ManuallyDrop::new(Agg::new(ctx, dims, ctx.w0, w1, rows_hint));
         // Simple people arrive in time order (sorted here if not).
         agg.presorted = true;
         let mut cx = Complex::new(ctx);
         let mut run = Run::default();
-        loop {
-            let cb = next_c.fetch_add(1, Relaxed);
-            if cb >= ncb {
-                break;
+        let mut clicks = Clicks::new();
+        // Clicks of people made complex by an undecodable event ID go to
+        // the general path here, whatever else those users have.
+        if t == 0 {
+            for &u in &dynamic.users {
+                run.clear(0);
+                for &(n, click) in unsafe { clicks.of(&g, &cks, u) } {
+                    let (name, complex, _) = unsafe { run.person(&g, &dynamic, n, false) };
+                    if complex {
+                        unsafe { cx.click(name, click) };
+                    }
+                }
             }
-            let _ = groups[cb].set(unsafe { CGroup::build(&cks[cb]) });
         }
-        barrier.wait();
 
-        let mut ingest = vec![0u32; 1 << BSHIFT];
-        let mut vals = vec![
-            Win {
-                ts: 0,
-                pc: 0,
-                user: 0
-            };
-            1 << BSHIFT
-        ];
+        let mut tags = vec![0u16; 1 << BSHIFT];
+        let mut vals = vec![EvRec { w0: 0, w1: 0 }; 1 << BSHIFT];
+        let mut gen = 0u16;
         let mut mine = Vec::new();
+        let mut meta: Vec<u64> = Vec::new();
         loop {
             let k = next_r.fetch_add(1, Relaxed);
             if k >= nranges {
@@ -1098,13 +1174,16 @@ pub fn run(
                     &g,
                     &dynamic,
                     &recs[b0..b1],
-                    &groups,
-                    &mut ingest,
+                    &cks,
+                    &mut clicks,
+                    &mut tags,
                     &mut vals,
+                    &mut gen,
+                    &sides,
                     &mut agg,
+                    &mut meta,
                     &mut cx,
                     &mut run,
-                    &seen,
                     &mut mine,
                     k,
                 )
@@ -1112,6 +1191,18 @@ pub fn run(
             ranges.lock().unwrap().push((k, r.0, r.1, r.2, r.3));
         }
         deferred.lock().unwrap().append(&mut mine);
+        {
+            // Nothing reaches the general path after this point: set-aside
+            // runs hold simple people only, and complex clicks were routed
+            // while parsing or before the ranges.
+            let done = std::mem::replace(&mut cx, Complex::new(ctx));
+            let lists = (done.pays.finish(), done.clks.finish());
+            let mut all = complex_lists.lock().unwrap();
+            all.push(lists);
+            if let Some(o) = odd_x.lock().unwrap().take() {
+                all.push((o.pays.finish(), o.clks.finish()));
+            }
+        }
         marks[0] = t0.elapsed().as_secs_f64() * 1e3;
         barrier.wait();
 
@@ -1131,119 +1222,122 @@ pub fn run(
             let live = rs.iter().map(|r| r.4).sum();
             let mut d = std::mem::take(&mut *deferred.lock().unwrap());
             d.sort_by_key(|x| (x.0, x.1));
-            let mut bounds = Vec::new();
+            // (size, task)
+            let mut tasks: Vec<(usize, (usize, usize))> = Vec::new();
             let mut s = 0;
             for i in 1..=d.len() {
                 if i == d.len() || d[i].2 != d[s].2 {
-                    bounds.push((s, i));
+                    let size = d[s..i].iter().map(|x| x.3.len()).sum();
+                    tasks.push((size, (s, i)));
                     s = i;
                 }
             }
-            let _ = plan.set((ordered, live, d, bounds));
-        }
-        barrier.wait();
-        let (ordered, _, d, bounds) = plan.get().unwrap();
-        if !*ordered {
-            return None;
-        }
-
-        // Users whose events span ranges.
-        loop {
-            let gi = next_d.fetch_add(1, Relaxed);
-            let Some(&(s, e)) = bounds.get(gi) else {
-                break;
-            };
-            let u = d[s].2;
-            unsafe {
-                run.clear(agg.evs.len());
-                for item in &d[s..e] {
-                    for &w in &item.3 {
-                        add_event(&g, &dynamic, &mut run, &mut agg, &mut cx, w);
-                    }
-                }
-                finish_run(
-                    &g,
-                    &dynamic,
-                    &mut run,
-                    clicks_of(&groups, &g, u),
-                    &mut agg,
-                    &mut cx,
-                );
-                set_bit(&seen, u as usize);
-                if agg.names.len() >= 4096 {
-                    consume_all(&mut agg);
-                }
-            }
-        }
-        unsafe { consume_all(&mut agg) };
-        marks[1] = t0.elapsed().as_secs_f64() * 1e3;
-        barrier.wait();
-
-        // Clicks of users with no surviving decoded event, for people made
-        // complex by an undecodable event.
-        if t == 0 {
-            for &u in &dynamic.users {
-                if bit(&seen, u as usize) {
-                    continue;
-                }
-                run.clear(agg.evs.len());
-                for &(n, click) in clicks_of(&groups, &g, u) {
-                    let (name, complex, _) = unsafe { run.person(&g, &dynamic, n, false) };
-                    if complex {
-                        unsafe { cx.click(name, click) };
-                    }
-                }
-            }
-        }
-        {
-            let lists = (cx.pays.finish(), cx.clks.finish());
-            let mut all = complex_lists.lock().unwrap();
-            all.push(lists);
-            if let Some(o) = odd_x.lock().unwrap().take() {
-                all.push((o.pays.finish(), o.clks.finish()));
-            }
-        }
-        barrier.wait();
-
-        // Complex people are grouped from scattered rows and need sorting.
-        agg.presorted = false;
-        // Largest partitions first: a shared device makes one person of
-        // thousands of users.
-        let order = {
             let lists = complex_lists.lock().unwrap();
-            let mut size = [0usize; XP];
-            for (lp, lc) in lists.iter() {
-                for p in 0..XP {
-                    size[p] += lp[p]
+            for p in 0..XP {
+                let mut size = 0usize;
+                for (lp, lc) in lists.iter() {
+                    size += lp[p]
                         .iter()
                         .chain(&lc[p])
                         .map(|b| b.n as usize)
                         .sum::<usize>();
                 }
-            }
-            for lc in &xclk_lists {
-                for p in 0..XP {
-                    size[p] += lc[p].iter().map(|b| b.n as usize).sum::<usize>();
+                for lc in &xclk_lists {
+                    size += lc[p].iter().map(|b| b.n as usize).sum::<usize>();
                 }
+                tasks.push((size, (XP + p, 0)));
             }
-            let mut order: Vec<usize> = (0..XP).collect();
-            order.sort_by_key(|&p| std::cmp::Reverse(size[p]));
-            order
-        };
+            tasks.sort_by_key(|x| std::cmp::Reverse(x.0));
+            let _ = plan.set((ordered, live, d, tasks.into_iter().map(|x| x.1).collect()));
+        }
+        barrier.wait();
+        let (ordered, _, d, tasks) = plan.get().unwrap();
+        if !*ordered {
+            return None;
+        }
+
         loop {
-            let Some(&p) = order.get(next_x.fetch_add(1, Relaxed)) else {
+            let Some(&(s, e)) = tasks.get(next_t.fetch_add(1, Relaxed)) else {
                 break;
             };
-            let (mut pays, mut clks) = (Vec::new(), Vec::new());
-            for (lp, lc) in complex_lists.lock().unwrap().iter() {
-                pays.extend_from_slice(&lp[p]);
-                clks.extend_from_slice(&lc[p]);
+            unsafe {
+                if e == 0 {
+                    // A complex partition: grouped from scattered rows, so
+                    // its people need sorting.
+                    let p = s - XP;
+                    consume_all(&mut agg);
+                    meta.clear();
+                    let (mut pays, mut clks) = (Vec::new(), Vec::new());
+                    for (lp, lc) in complex_lists.lock().unwrap().iter() {
+                        pays.extend_from_slice(&lp[p]);
+                        clks.extend_from_slice(&lc[p]);
+                    }
+                    for lc in &xclk_lists {
+                        clks.extend_from_slice(&lc[p]);
+                    }
+                    agg.presorted = false;
+                    agg.partition(&pays, &clks);
+                    agg.presorted = true;
+                    // `partition` consumed its people but leaves them listed.
+                    agg.names.clear();
+                    agg.ev_end.clear();
+                    agg.ck_end.clear();
+                    agg.evs.clear();
+                    agg.cks.clear();
+                } else {
+                    // A user whose events span ranges, from the earliest
+                    // range on: index order again.
+                    let u = d[s].2;
+                    meta.resize(agg.evs.len(), 0);
+                    let mut o = Open {
+                        u,
+                        a: agg.evs.len(),
+                        aliases: 0,
+                        wide: false,
+                        sorted: true,
+                        last_t: 0,
+                    };
+                    for item in &d[s..e] {
+                        for w in &item.3 {
+                            agg.evs.push(g.word(w.ts, w.pc));
+                            let n = w.user >> 8;
+                            meta.push(n);
+                            let alias = n & 511;
+                            if alias < 16 {
+                                o.aliases |= 1 << alias;
+                            } else {
+                                o.wide = true;
+                            }
+                            let t = u64::from(w.ts);
+                            o.sorted &= t >= o.last_t;
+                            o.last_t = t;
+                        }
+                    }
+                    end_user(
+                        &g,
+                        &dynamic,
+                        &o,
+                        &cks,
+                        &mut clicks,
+                        &mut agg,
+                        &mut meta,
+                        &mut cx,
+                        &mut run,
+                    );
+                    if agg.names.len() >= 4096 {
+                        consume_all(&mut agg);
+                        meta.clear();
+                    }
+                }
             }
-            for lc in &xclk_lists {
-                clks.extend_from_slice(&lc[p]);
-            }
-            unsafe { agg.partition(&pays, &clks) };
         }
+        unsafe { consume_all(&mut agg) };
+        debug_assert!(cx
+            .pays
+            .finish()
+            .iter()
+            .chain(&cx.clks.finish())
+            .all(|b| b.is_empty()));
         marks[2] = t0.elapsed().as_secs_f64() * 1e3;
         if agg.out.rows > 0 || t == 0 {
             let rows = agg.out.rows;
@@ -1271,11 +1365,10 @@ pub fn run(
             .sum();
         let (_, live, d, _) = plan.get().unwrap();
         eprintln!(
-            "  gx: {live} live, {odd_events} odd, {} split runs; ranges {:.1}..{:.1} split {:.1} complex {:.1} write {:.1} ms; complex events {xe}",
+            "  gx: {live} live, {odd_events} odd, {} split runs; ranges {:.1}..{:.1} rest {:.1} write {:.1} ms; complex events {xe}",
             d.len(),
             best(0),
             worst(0),
-            worst(1),
             worst(2),
             worst(3)
         );
@@ -1301,15 +1394,29 @@ pub fn run(
 /// complex events were already passed on.
 type Deferred = (usize, u8, u64, Vec<Win>);
 
-/// One click bucket's clicks grouped by user number.
-struct CGroup {
+/// One click bucket's clicks grouped by user number, rebuilt in place when
+/// a worker moves on to the next bucket. Workers visit users in increasing
+/// order, so each bucket is grouped about once and stays in cache.
+struct Clicks {
+    bucket: usize,
     base: u64,
     offs: Vec<u32>,
+    fill: Vec<u32>,
     items: Vec<(u64, Click)>,
 }
 
-impl CGroup {
-    unsafe fn build(blocks: &[Blk]) -> CGroup {
+impl Clicks {
+    fn new() -> Self {
+        Clicks {
+            bucket: usize::MAX,
+            base: 0,
+            offs: vec![0],
+            fill: Vec::new(),
+            items: Vec::new(),
+        }
+    }
+
+    unsafe fn build(&mut self, blocks: &[Blk]) {
         let recs = || {
             blocks
                 .iter()
@@ -1321,48 +1428,53 @@ impl CGroup {
             lo = lo.min(u);
             hi = hi.max(u);
         }
+        self.offs.clear();
+        self.items.clear();
         if lo > hi {
-            return CGroup {
-                base: 0,
-                offs: vec![0],
-                items: Vec::new(),
-            };
+            self.base = 0;
+            self.offs.push(0);
+            return;
         }
         let span = (hi - lo + 1) as usize;
-        let mut offs = vec![0u32; span + 1];
+        self.offs.resize(span + 1, 0);
+        let offs = self.offs.as_mut_ptr();
         for c in recs() {
-            offs[((c.user >> 17) - lo) as usize + 1] += 1;
+            *offs.add(((c.user >> 17) - lo) as usize + 1) += 1;
         }
         for i in 1..=span {
-            offs[i] += offs[i - 1];
+            *offs.add(i) += *offs.add(i - 1);
         }
-        let mut items = vec![(0, Click::default()); offs[span] as usize];
-        let mut fill = offs.clone();
+        let total = *offs.add(span) as usize;
+        self.fill.clear();
+        self.fill.extend_from_slice(&self.offs);
+        if self.items.capacity() < total {
+            self.items.reserve(total);
+        }
+        let items = self.items.as_mut_ptr();
+        let fill = self.fill.as_mut_ptr();
         for c in recs() {
-            let at = &mut fill[((c.user >> 17) - lo) as usize];
-            items[*at as usize] = (c.user >> 8, c.click);
+            let at = fill.add(((c.user >> 17) - lo) as usize);
+            items.add(*at as usize).write((c.user >> 8, c.click));
             *at += 1;
         }
-        CGroup {
-            base: lo,
-            offs,
-            items,
-        }
+        self.items.set_len(total);
+        self.base = lo;
     }
 
+    /// User `u`'s clicks.
     #[inline(always)]
-    fn get(&self, u: u64) -> &[(u64, Click)] {
+    unsafe fn of(&mut self, g: &G, cks: &[Vec<Blk>], u: u64) -> &[(u64, Click)] {
+        let b = g.cbucket(u);
+        if b != self.bucket {
+            self.build(&cks[b]);
+            self.bucket = b;
+        }
         if u < self.base || u - self.base + 1 >= self.offs.len() as u64 {
             return &[];
         }
         let i = (u - self.base) as usize;
         &self.items[self.offs[i] as usize..self.offs[i + 1] as usize]
     }
-}
-
-#[inline(always)]
-fn clicks_of<'a>(groups: &'a [OnceLock<CGroup>], g: &G, u: u64) -> &'a [(u64, Click)] {
-    groups[g.cbucket(u)].get().map_or(&[], |grp| grp.get(u))
 }
 
 unsafe fn consume_all(agg: &mut Agg) {
@@ -1410,85 +1522,250 @@ unsafe fn add_event(
     true
 }
 
-/// Dedups and aggregates the buckets of one range. Returns the first and
-/// last decoded user number, whether they never decrease, and the number of
-/// surviving events.
+/// The user whose events are being appended.
+struct Open {
+    u: u64,
+    /// Index of the user's first event in `agg.evs`.
+    a: usize,
+    /// Alias numbers below 16 seen, one bit each.
+    aliases: u32,
+    /// An alias of 16 or more was seen.
+    wide: bool,
+    sorted: bool,
+    last_t: u64,
+}
+
+/// Which of a user's clicks belong to the user's one simple person.
+#[derive(Clone, Copy)]
+enum Owner {
+    /// Every linked alias below 8, as a bit mask.
+    Linked(u32),
+    /// Exactly this unlinked user number.
+    Single(u64),
+}
+
+/// The events `agg.evs[from..]` as rows again, with their user numbers.
+fn rows_of(agg: &Agg, meta: &[u64], from: usize, shift: u32) -> Vec<Win> {
+    (from..agg.evs.len())
+        .map(|i| {
+            let w = agg.evs[i];
+            Win {
+                ts: (w >> shift) as u32,
+                pc: (w & ((1 << shift) - 1)) as u32,
+                user: (meta[i] << 8) | REG,
+            }
+        })
+        .collect()
+}
+
+/// Finishes user `o`, whose events are `agg.evs[o.a..]`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn end_user(
+    g: &G,
+    dynamic: &Dynamic,
+    o: &Open,
+    cks: &[Vec<Blk>],
+    clicks: &mut Clicks,
+    agg: &mut Agg,
+    meta: &mut Vec<u64>,
+    cx: &mut Complex,
+    run: &mut Run,
+) {
+    let shift = PRICE_BITS + g.ctx.cat_bits;
+    let u = o.u;
+    let dynamic_user = !dynamic.users.is_empty() && dynamic.users.binary_search(&u).is_ok();
+    if !o.wide && !dynamic_user {
+        let bits = g.users.get(u as usize).map_or(0, |e| e.bits.load(Relaxed));
+        if bits & (MULTI | LINKED_HIGH) == 0 {
+            let linked = bits & 0xFF;
+            let one = if linked != 0 && o.aliases & !linked == 0 {
+                let c = g.users[u as usize].canon.load(Relaxed);
+                Some((c, bits & CX != 0, Owner::Linked(linked)))
+            } else if o.aliases & linked == 0 && o.aliases.count_ones() == 1 {
+                let n = meta[o.a];
+                Some((name_of_number(n, g.keys.user), false, Owner::Single(n)))
+            } else {
+                None
+            };
+            if let Some((person, complex, owner)) = one {
+                if !complex && !dynamic.has(person) {
+                    let e = agg.evs.len();
+                    agg.names.push(person);
+                    if !o.sorted {
+                        agg.evs[o.a..e].sort_unstable();
+                    }
+                    agg.ev_end.push(e as u32);
+                    for &(n, click) in clicks.of(g, cks, u) {
+                        let mine = match owner {
+                            Owner::Linked(m) => {
+                                let a = n & 511;
+                                a < 8 && (m >> a) & 1 != 0
+                            }
+                            Owner::Single(only) => n == only,
+                        };
+                        // Clicks of the user's other people: those people
+                        // have no events here, and a complex one had its
+                        // clicks routed while parsing.
+                        if mine {
+                            agg.cks.push(click);
+                        }
+                    }
+                    agg.ck_end.push(agg.cks.len() as u32);
+                    return;
+                }
+            }
+        }
+    }
+    // Several people, a complex person, wide aliases, or a person made
+    // complex by an undecodable event: one event at a time.
+    let rows = rows_of(agg, meta, o.a, shift);
+    agg.evs.truncate(o.a);
+    run.clear(o.a);
+    for w in rows {
+        add_event(g, dynamic, run, agg, cx, w);
+    }
+    // A dynamic user's complex clicks were passed on before the ranges.
+    finish_run(
+        g,
+        dynamic,
+        run,
+        clicks.of(g, cks, u),
+        agg,
+        cx,
+        !dynamic_user,
+    );
+    meta.resize(agg.evs.len(), 0);
+}
+
+/// Sets aside user `o`, which may continue in a neighbouring range. Its
+/// complex people's events go to the general path now, so the complex
+/// partitions are complete once every range is done.
+#[allow(clippy::too_many_arguments)]
+unsafe fn defer_user(
+    g: &G,
+    dynamic: &Dynamic,
+    o: &Open,
+    which: u8,
+    k: usize,
+    agg: &mut Agg,
+    meta: &mut Vec<u64>,
+    cx: &mut Complex,
+    run: &mut Run,
+    deferred: &mut Vec<Deferred>,
+) {
+    let shift = PRICE_BITS + g.ctx.cat_bits;
+    let rows = rows_of(agg, meta, o.a, shift);
+    agg.evs.truncate(o.a);
+    meta.truncate(o.a);
+    run.clear(0);
+    let kept: Vec<Win> = rows
+        .into_iter()
+        .filter(|w| {
+            let (name, complex, _) = run.person(g, dynamic, w.user >> 8, false);
+            if complex {
+                cx.event(name, g.word(w.ts, w.pc));
+            }
+            !complex
+        })
+        .collect();
+    deferred.push((k, which, o.u, kept));
+}
+
+/// Dedups and aggregates the buckets of one range. Survivors are appended
+/// to `agg.evs` in index order, with their user numbers in `meta`, so each
+/// user's events form one slice. The range's first and last user may
+/// continue in a neighbouring range and are set aside. Returns the first
+/// and last decoded user number, whether they never decrease, and the
+/// number of surviving events.
 #[allow(clippy::too_many_arguments)]
 unsafe fn range_people(
     g: &G,
     dynamic: &Dynamic,
     recs: &[Vec<Blk>],
-    groups: &[OnceLock<CGroup>],
-    ingest: &mut [u32],
-    vals: &mut [Win],
+    cks: &[Vec<Blk>],
+    clicks: &mut Clicks,
+    tags: &mut [u16],
+    vals: &mut [EvRec],
+    gen: &mut u16,
+    sides: &[Vec<u64>],
     agg: &mut Agg,
+    meta: &mut Vec<u64>,
     cx: &mut Complex,
     run: &mut Run,
-    seen: &[AtomicU64],
     deferred: &mut Vec<Deferred>,
     k: usize,
 ) -> (u64, u64, bool, usize) {
+    let shift = PRICE_BITS + g.ctx.cat_bits;
     let (mut first, mut last, mut ordered, mut live) = (NO_U, NO_U, true, 0usize);
-    let mut current = NO_U;
     let mut runs = 0usize;
+    meta.clear();
+    let mut o = Open {
+        u: NO_U,
+        a: 0,
+        aliases: 0,
+        wide: false,
+        sorted: true,
+        last_t: 0,
+    };
     for blocks in recs {
+        // A slot belongs to this bucket when its tag is this bucket's
+        // generation, so the slots never need clearing.
+        *gen = gen.wrapping_add(1);
+        if *gen == 0 {
+            tags.fill(0);
+            *gen = 1;
+        }
+        let tag = *gen;
         for blk in blocks {
             for r in std::slice::from_raw_parts(blk.ptr as *const EvRec, blk.n as usize) {
-                let s = (r.i & BMASK) as usize;
-                let cur = *ingest.get_unchecked(s);
-                if cur == 0 || r.ingest < cur {
-                    *ingest.get_unchecked_mut(s) = r.ingest;
-                    *vals.get_unchecked_mut(s) = Win {
-                        ts: r.ts,
-                        pc: r.pc,
-                        user: r.user,
-                    };
+                let s = (r.w1 & u64::from(BMASK)) as usize;
+                if *tags.get_unchecked(s) != tag || r.ingest() < vals.get_unchecked(s).ingest() {
+                    *tags.get_unchecked_mut(s) = tag;
+                    *vals.get_unchecked_mut(s) = *r;
                 }
             }
         }
-        // Occupied slots, eight at a time; each group is freed as it is read.
+        // This bucket's slots in index order, sixteen tags at a time.
+        let tagv = _mm256_set1_epi16(tag as i16);
         let mut group = 0;
-        while group < ingest.len() {
-            let at = ingest.as_mut_ptr().add(group).cast::<__m256i>();
-            let v = _mm256_loadu_si256(at);
-            let free = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(
-                v,
-                _mm256_setzero_si256(),
-            )));
-            let mut full = !free as u32 & 0xFF;
+        while group < tags.len() {
+            let v = _mm256_loadu_si256(tags.as_ptr().add(group).cast());
+            let eq = _mm256_movemask_epi8(_mm256_cmpeq_epi16(v, tagv)) as u32;
+            let mut full = _pext_u32(eq, 0x5555_5555);
             let first_slot = group;
-            group += 8;
-            if full == 0 {
-                continue;
-            }
-            _mm256_storeu_si256(at, _mm256_setzero_si256());
-            let mut slots = [0usize; 8];
-            let mut m = 0;
+            group += 16;
             while full != 0 {
-                slots[m] = first_slot + full.trailing_zeros() as usize;
-                m += 1;
+                let s = first_slot + full.trailing_zeros() as usize;
                 full &= full - 1;
-            }
-            for &s in &slots[..m] {
-                let w = *vals.get_unchecked(s);
-                if w.ts == NO_TS {
+                let r = *vals.get_unchecked(s);
+                if r.w0 == W0_INVALID {
                     continue;
                 }
                 live += 1;
-                if w.user & 0xFF != REG {
-                    // An undecodable user ID: always the general path.
-                    let (canonical, _) = g.resolve(w.user);
-                    cx.event(canonical, g.word(w.ts, w.pc));
-                    continue;
-                }
-                let u = w.user >> 17;
-                if u != current {
-                    if current != NO_U {
+                let ts = r.w0 >> 33;
+                let word = (ts << shift) | ((r.w0 >> 4) & PC_MASK);
+                let refr = r.w1 >> USER_SHIFT;
+                let n = if refr & SIDE == 0 {
+                    (refr << 9) | (r.w0 & 15)
+                } else {
+                    let uw = *sides
+                        .get_unchecked(((refr >> SIDE_TID) & 15) as usize)
+                        .get_unchecked((refr & (SIDE_MAX as u64 - 1)) as usize);
+                    if uw & 0xFF != REG {
+                        // An undecodable user ID: always the general path.
+                        let (canonical, _) = g.resolve(uw);
+                        cx.event(canonical, word);
+                        continue;
+                    }
+                    uw >> 8
+                };
+                let u = n >> 9;
+                if u != o.u {
+                    if o.u != NO_U {
                         if runs == 1 {
-                            deferred.push((k, 0, current, std::mem::take(&mut run.raw)));
+                            defer_user(g, dynamic, &o, 0, k, agg, meta, cx, run, deferred);
                         } else {
-                            finish_run(g, dynamic, run, clicks_of(groups, g, current), agg, cx);
-                            set_bit(seen, current as usize);
+                            end_user(g, dynamic, &o, cks, clicks, agg, meta, cx, run);
                         }
                     }
                     if first == NO_U {
@@ -1497,29 +1774,45 @@ unsafe fn range_people(
                         ordered = false;
                     }
                     last = u;
-                    current = u;
                     runs += 1;
-                    run.clear(agg.evs.len());
+                    o = Open {
+                        u,
+                        a: agg.evs.len(),
+                        aliases: 0,
+                        wide: false,
+                        sorted: true,
+                        last_t: 0,
+                    };
                 }
-                if runs == 1 {
-                    run.raw.push(w);
-                } else if add_event(g, dynamic, run, agg, cx, w) {
-                    run.raw.push(w);
+                agg.evs.push(word);
+                meta.push(n);
+                let alias = n & 511;
+                if alias < 16 {
+                    o.aliases |= 1 << alias;
+                } else {
+                    o.wide = true;
                 }
+                o.sorted &= ts >= o.last_t;
+                o.last_t = ts;
             }
         }
     }
-    if current != NO_U {
-        // The range's last run: its events in the aggregator are withdrawn.
-        agg.evs.truncate(run.start);
-        deferred.push((
-            k,
+    if o.u != NO_U {
+        defer_user(
+            g,
+            dynamic,
+            &o,
             if runs == 1 { 0 } else { 1 },
-            current,
-            std::mem::take(&mut run.raw),
-        ));
+            k,
+            agg,
+            meta,
+            cx,
+            run,
+            deferred,
+        );
     }
     consume_all(agg);
+    meta.clear();
     (first, last, ordered, live)
 }
 
@@ -1531,11 +1824,14 @@ unsafe fn finish_run(
     clicks: &[(u64, Click)],
     agg: &mut Agg,
     cx: &mut Complex,
+    route: bool,
 ) {
     for &(n, click) in clicks {
         let (name, complex, lp) = run.person(g, dynamic, n, false);
         if complex {
-            cx.click(name, click);
+            if route {
+                cx.click(name, click);
+            }
         } else if lp != NOT_HERE {
             if run.multi {
                 run.clicks.push((lp, click));

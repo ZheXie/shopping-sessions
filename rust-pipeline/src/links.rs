@@ -104,6 +104,14 @@ pub unsafe fn keep_name(raw: Name, copy: impl FnOnce(*const u8, usize) -> *const
     ((copy(bytes.as_ptr(), bytes.len()) as u64) << 8) | (raw & PRINT)
 }
 
+/// Starts loading a long name's bytes (its hash and comparisons need them).
+#[inline(always)]
+pub unsafe fn prefetch_name(n: Name) {
+    if n & INLINE == 0 {
+        _mm_prefetch(addr(n) as *const i8, _MM_HINT_T0);
+    }
+}
+
 #[inline(always)]
 fn inline_hash(n: Name) -> u64 {
     (n ^ n.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15)

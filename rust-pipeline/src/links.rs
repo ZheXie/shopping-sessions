@@ -93,6 +93,17 @@ pub unsafe fn name_hashed(
     (((stable() as u64) << 8) | (print << PRINT_SHIFT), h)
 }
 
+/// A long name moved to bytes from `copy`, with the same fingerprint.
+/// Inline names are returned unchanged.
+#[inline(always)]
+pub unsafe fn keep_name(raw: Name, copy: impl FnOnce(*const u8, usize) -> *const u8) -> Name {
+    if raw & INLINE != 0 {
+        return raw;
+    }
+    let bytes = id_bytes(addr(raw));
+    ((copy(bytes.as_ptr(), bytes.len()) as u64) << 8) | (raw & PRINT)
+}
+
 #[inline(always)]
 fn inline_hash(n: Name) -> u64 {
     (n ^ n.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
@@ -263,14 +274,26 @@ impl Table {
     // name is never evicted, so a miss on two occupied slots always follows
     // the same ordinary name partition, even across concurrent parsers.
     #[inline(always)]
+    #[cfg(test)]
     unsafe fn unlinked(&self, group: usize, raw: Name, fallback: usize) -> (Name, usize) {
+        self.unlinked_keep(group, raw, fallback, &mut |n| n)
+    }
+
+    /// `keep` turns a name whose bytes are only valid during the parse
+    /// into one that lives until exit; it runs only when the name escapes
+    /// (a claimed slot or the fallback partition).
+    #[inline(always)]
+    unsafe fn unlinked_keep(
+        &self, group: usize, raw: Name, fallback: usize, keep: &mut impl FnMut(Name) -> Name,
+    ) -> (Name, usize) {
         let g = &*self.groups.add(group);
         for lane in 0..2 {
             let cell = &g.unlinked[lane];
             let mut full = cell.load(Relaxed);
             if full & !OVERFLOW == 0 {
-                match cell.compare_exchange(full, full | raw, Relaxed, Relaxed) {
-                    Ok(_) => full |= raw,
+                let kept = keep(raw);
+                match cell.compare_exchange(full, full | kept, Relaxed, Relaxed) {
+                    Ok(_) => full |= kept,
                     Err(other) => full = other,
                 }
             }
@@ -278,15 +301,23 @@ impl Table {
                 return self.split(self.cap + 2 * group + lane);
             }
         }
-        (raw, fallback)
+        (keep(raw), fallback)
     }
 
+    #[cfg(test)]
     #[inline(always)]
-    pub unsafe fn route(
-        &self, mut group: usize, name: Name, fallback: usize,
+    pub unsafe fn route(&self, group: usize, name: Name, fallback: usize) -> (Name, usize) {
+        self.route_keep(group, name, fallback, |n| n)
+    }
+
+    /// `route` for a name that may point into a reusable read buffer; see
+    /// `unlinked_keep`.
+    #[inline(always)]
+    pub unsafe fn route_keep(
+        &self, mut group: usize, name: Name, fallback: usize, mut keep: impl FnMut(Name) -> Name,
     ) -> (Name, usize) {
         if self.cap == 0 {
-            return (name, fallback);
+            return (keep(name), fallback);
         }
         loop {
             let g = &*self.groups.add(group);
@@ -300,20 +331,20 @@ impl Table {
                     return self.split(g.roots.get_unchecked(lane).load(Relaxed) as usize);
                 }
                 if g.unlinked[1].load(Relaxed) & OVERFLOW == 0 {
-                    return self.unlinked(group, name, fallback);
+                    return self.unlinked_keep(group, name, fallback, &mut keep);
                 }
             } else {
                 for lane in 0..4 {
                     let key = g.keys[lane].load(Relaxed);
                     if key == 0 {
-                        return self.unlinked(group, name, fallback);
+                        return self.unlinked_keep(group, name, fallback, &mut keep);
                     }
                     if same_name(key, name) {
                         return self.split(g.roots[lane].load(Relaxed) as usize);
                     }
                 }
                 if g.unlinked[1].load(Relaxed) & OVERFLOW == 0 {
-                    return self.unlinked(group, name, fallback);
+                    return self.unlinked_keep(group, name, fallback, &mut keep);
                 }
             }
             group += 1;

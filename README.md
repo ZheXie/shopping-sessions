@@ -31,6 +31,13 @@ tear down at exit (about 100 ms between the last lap and process exit).
   bits of the partition word. With only the 15-bit fingerprint, thousands of
   long keys per partition shared probe slots and each false match loaded two
   extension records and both IDs.
+- A user ID stays in the read buffer until routing decides that it escapes
+  (it claims an unlinked slot or goes to the fallback partition); only then
+  is it copied. Most rows belong to someone already seen, so this skips
+  about 120 MB of copies on 20M events.
+- Reads are 256 KB instead of 2 MB, so the pread buffer stays in the L2 that
+  two hyperthreads share. That is neutral on the 96 MB L3 used for these
+  measurements but avoids writing the input back to DRAM on a smaller cache.
 - The generator in `third_party/generator`, used only for the profile-guided
   build, emits the same shape of IDs so the profile covers these paths.
 - The generator-aware path cannot apply to opaque IDs; it is now opt-in
@@ -43,10 +50,12 @@ min/median ms:
 | --- | --- | --- | --- |
 | before (`20fce38`, the general path of `c925b6e`) | 230/236 | 334/335 | 431/434 |
 | arena, AVX2 `id_bytes`, name fingerprints (`879f314`) | 176/181 | 259/270 | 272/283 |
-| prefetch, one hash, dedup hash bits | 163/166 | 242/246 | 253/258 |
+| prefetch, one hash, dedup hash bits (`6910390`) | 163/166 | 242/246 | 253/258 |
+| copy user IDs on escape, 256 KB reads | 159/161 | 236/240 | 247/251 |
 
 On four cores the wall time went from 718/757 to 513/540 ms at `879f314`
-and to 453/493 ms now. `879f314` scored 0.7631 s on the practice board. Output matches
+and to 453/493 ms at `6910390`. On the practice board `879f314` scored
+0.7631 s; the board showed 0.7558 s after `6910390`. Output matches
 the Python reference on the 1M set in that shape, and fixtures, the public dev
 answer and seeds 2–3 still match.
 

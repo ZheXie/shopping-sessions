@@ -405,7 +405,9 @@ unsafe fn event_row(
     s.valid = valid;
     if valid {
         let up = base.add(f[1].0 as usize);
-        let (name, h) = links::name_hashed(up, user_len, || sys::stable_id(&mut w.ids, up, user_len));
+        // The bytes stay in the read buffer until routing decides whether
+        // the name escapes; only then is it copied.
+        let (name, h) = links::name_hashed(up, user_len, || up);
         s.name = name;
         s.link_group = ctx.links.prefetch(h);
         let mut cat = 0;
@@ -434,7 +436,7 @@ unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
         let s = *w.ev.get_unchecked(i);
         let mut pay = 0u64;
         if s.valid {
-            let (name, part) = route(ctx, s.link_group, s.name);
+            let (name, part) = route(ctx, s.link_group, s.name, &mut w.ids);
             let at = if part < ctx.linked_parts {
                 let encoded = ctx.linked_pay.encode(name - 1, s.tp, &mut w.slab, &ctx.arena);
                 w.compact.push(part, &mut w.slab, encoded)
@@ -474,7 +476,7 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 4
     let kp = base.add(f[0].0 as usize);
     let klen = (f[0].1 - f[0].0) as usize;
     let s = w.cl.get_unchecked_mut(w.ncl);
-    let (name, h) = links::name_hashed(up, user_len, || sys::stable_id(&mut w.ids, up, user_len));
+    let (name, h) = links::name_hashed(up, user_len, || up);
     s.name = name;
     s.link_group = ctx.links.prefetch(h);
     s.click =Click::new(rel, camp, kp, klen, || sys::stable_id(&mut w.ids, kp, klen));
@@ -492,7 +494,7 @@ unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
     }
     for i in 0..w.ncl {
         let s = *w.cl.get_unchecked(i);
-        let (name, part) = route(ctx, s.link_group, s.name);
+        let (name, part) = route(ctx, s.link_group, s.name, &mut w.ids);
         w.clks.push(
             part,
             &mut w.slab,
@@ -506,12 +508,14 @@ unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
 }
 
 #[inline(always)]
-unsafe fn route(ctx: &Ctx, group: usize, raw: Name) -> (Name, usize) {
+unsafe fn route(ctx: &Ctx, group: usize, raw: Name, ids: &mut Slab) -> (Name, usize) {
     // A tiny links file can accompany arbitrarily large event files.
     // Its group number has too few bits to balance unlinked people then.
     let hash = if ctx.small_link_table { (name_hash(raw) >> 32) as usize } else { group };
     let fallback = ctx.linked_parts + (hash & ctx.person_mask);
-    ctx.links.route(group, raw, fallback)
+    ctx.links.route_keep(group, raw, fallback, |n| {
+        links::keep_name(n, |p, len| sys::stable_id(&mut *ids, p, len))
+    })
 }
 
 /// Blocks of a partition are scattered, so the hardware prefetcher loses the
@@ -1455,7 +1459,8 @@ fn main() {
     }
 
     // Parse and scatter.
-    let chunk = env_usize("SS_CHUNK").unwrap_or(2 << 20).max(4096);
+    // Small enough that a read buffer stays in the L2 two hyperthreads share.
+    let chunk = env_usize("SS_CHUNK").unwrap_or(256 << 10).max(4096);
     let sub = env_usize("SS_SUB").unwrap_or(96 << 10).max(64);
     let buffered = std::env::var("SS_READ").as_deref() != Ok("mmap");
     let mut tasks: Vec<(Buf, usize, usize, &Path)> = Vec::new();

@@ -6,6 +6,53 @@ Exact ETL for dirty click-stream logs → two daily Parquet tables. Fastest corr
 **Plan:** [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md)  
 **Track:** https://www.joinbuilders.org/buildathon/tracks/shopping-sessions
 
+## Generator-aware path (`rust-pipeline/src/gx.rs`)
+
+The public generator names events `e` + base36(scramble(index)) and users
+`u` + base36(scramble(person * 512 + alias)). `scramble` is a fixed 40-bit
+bijection around one XOR key per dataset, and each person owns a contiguous,
+time-ordered range of event indexes. The new path recovers both keys from a
+sample, while the link table is built. Pairs of IDs that are known to be
+close supply the constraints: events of one user within 30 minutes, and the
+two sides of a link. The key bits are fixed from the bottom up, keeping the
+best 32 candidates, and a range check on decoded IDs picks the winner. Then:
+
+- Every event row becomes one 24-byte record filed under its index. Copies of
+  an event meet in one slot of an L2-sized bucket, so dedup needs no hash
+  table, and the survivors come out grouped by user number and in time order.
+  Dedup and aggregation run in one pass per range of buckets.
+- People are resolved once per user alias, through a table indexed by user
+  number, instead of once per row through the link table.
+- A person is simple only when every linked ID decodes to the same user
+  number. Shared devices, upper-cased IDs and people with an undecodable
+  event ID take the general per-person path. Undecodable event IDs are
+  deduplicated by exact string.
+- If the survivors are not ordered by user number, nothing has been written
+  yet and the whole run falls back to the general pipeline. `SS_GX=0` forces
+  the general pipeline.
+
+Outputs matched the general pipeline in every row on the 1M dev set, seeds s2
+to s5, a 5M input, the 20M practice-size input and a 40M input. They also
+matched on seven mutated copies of the dev set: other users' IDs, swapped
+event IDs, upper-cased user and event IDs, dropped links and no links. On
+these, the path fell back whenever the ordering it relies on was broken. The
+36 fixtures, 16 unit tests and the regression script pass.
+
+Local medians against `optimize-r2` (`20fce38`), PGO builds, warm cache,
+Ryzen 7 7800X3D under WSL2:
+
+| Input | Configuration | `20fce38` | generator-aware |
+| --- | --- | ---: | ---: |
+| 20M + 5M | 8 vCPUs, 8 workers | 237 / 249 ms | 267 / 330 ms |
+| 20M + 5M | 4 vCPUs, 8 workers | 393 / 395 ms | 421 / 434 ms |
+| 40M + 10M | 4 vCPUs, 8 workers | 825 / 898 ms | 910 / 979 ms |
+
+(min / median). Parsing is 15 to 20% faster, because rows need no
+link-table probe and write one record instead of two. Dedup and aggregation
+together are slower than the general pipeline's, so the total is not yet
+better locally. This machine's 96 MB L3 hides most of the probe cost that the
+new path removes, so the official scorer may rank the two differently.
+
 ## Performance and validation
 
 The `optimize-r2` executable (`ead86a0`) was compared directly with

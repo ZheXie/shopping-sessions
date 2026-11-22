@@ -72,6 +72,17 @@ fn inline_len(n: Name) -> usize {
     9 - unsafe { _pext_u64(n, LENGTH_BITS) } as usize
 }
 
+/// For an inline name, the bytes after its leading `u` (little-endian,
+/// zero-padded) and the whole ID's length.
+#[inline(always)]
+pub fn inline_chars(n: Name) -> Option<(u64, usize)> {
+    if n & INLINE == 0 {
+        None
+    } else {
+        Some((n & ASCII, inline_len(n)))
+    }
+}
+
 #[inline(always)]
 pub fn same_name(a: Name, b: Name) -> bool {
     a == b
@@ -244,6 +255,50 @@ impl Table {
         }
     }
 
+    /// The root slot of a linked name. Unlike `route`, this never claims a
+    /// slot for an unlinked name, so the table stays unchanged.
+    #[inline(always)]
+    pub unsafe fn root_of(&self, name: Name) -> Option<usize> {
+        if self.cap == 0 {
+            return None;
+        }
+        let mut group = self.first_slot(name_hash(name)) / 4;
+        loop {
+            let g = &*self.groups.add(group);
+            for lane in 0..4 {
+                let key = g.keys[lane].load(Relaxed);
+                if key == 0 {
+                    return None;
+                }
+                if same_name(key, name) {
+                    return Some(g.roots[lane].load(Relaxed) as usize);
+                }
+            }
+            if g.unlinked[1].load(Relaxed) & OVERFLOW == 0 {
+                return None;
+            }
+            group += 1;
+            if group == self.cap / 4 {
+                group = 0;
+            }
+        }
+    }
+
+    /// Alias slots, occupied or not.
+    pub fn cap(&self) -> usize {
+        self.cap
+    }
+
+    /// The name in alias slot `s` (0 if free) and its root slot.
+    #[inline(always)]
+    pub unsafe fn slot(&self, s: usize) -> (Name, usize) {
+        let g = &*self.groups.add(s / 4);
+        (
+            g.keys[s % 4].load(Relaxed),
+            g.roots[s % 4].load(Relaxed) as usize,
+        )
+    }
+
     pub fn groups(&self) -> usize {
         self.cap / 4
     }
@@ -259,7 +314,11 @@ impl Table {
     // Bound the number of parser cursors, including the two independent
     // people that each four-slot alias group can now accommodate.
     fn shift_for(cap: usize) -> u32 {
-        (cap + cap / 2).div_ceil(4096).next_power_of_two().max(8192).trailing_zeros()
+        (cap + cap / 2)
+            .div_ceil(4096)
+            .next_power_of_two()
+            .max(8192)
+            .trailing_zeros()
     }
 
     pub unsafe fn canonical(&self, root: usize) -> Name {
@@ -426,7 +485,10 @@ mod tests {
             .filter(|&name| (name_hash(name) as u128 * cap as u128 >> 64) as usize >= cap - 4)
             .take(edge_count + 2)
             .collect();
-        let edges = names[1..=edge_count].iter().map(|&name| (names[0], name)).collect();
+        let edges = names[1..=edge_count]
+            .iter()
+            .map(|&name| (names[0], name))
+            .collect();
         let table = Table::build(&[edges], 1);
         let resolve = |name| unsafe {
             let (local, part) = table.route(table.prefetch(name_hash(name)), name, usize::MAX);
@@ -468,7 +530,10 @@ mod tests {
             let (local2, part2) = table.unlinked(0, second, usize::MAX);
             assert!(part2 < table.parts());
             assert_ne!((local2, part2), (local, part));
-            assert_eq!(table.canonical((part2 << table.shift()) + local2 as usize - 1), second);
+            assert_eq!(
+                table.canonical((part2 << table.shift()) + local2 as usize - 1),
+                second
+            );
             for _ in 0..3 {
                 assert_eq!(table.unlinked(0, third, usize::MAX), (third, usize::MAX));
                 assert_eq!(table.unlinked(0, second, usize::MAX), (local2, part2));

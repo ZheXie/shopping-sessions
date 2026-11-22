@@ -15,6 +15,7 @@ mod click;
 mod dense_sessions;
 mod dim;
 mod event_key;
+mod gx;
 mod hashx;
 mod links;
 mod linked_pay;
@@ -638,6 +639,8 @@ struct Out {
 struct Agg<'a> {
     ctx: &'a Ctx,
     simd_sort: bool,
+    /// Set when every person handed to `consume` already has events in time order.
+    presorted: bool,
     dense: DenseSessions,
     cat_names: &'a [Vec<u8>],
     ndays: usize,
@@ -671,6 +674,7 @@ impl<'a> Agg<'a> {
         Agg {
             ctx,
             dense: DenseSessions::default(),
+            presorted: false,
             simd_sort: std::env::var_os("SS_AVX2").as_deref() != Some(std::ffi::OsStr::new("1"))
                 && is_x86_feature_detected!("avx512f"),
             cat_names: &dims.cat_names,
@@ -908,6 +912,7 @@ impl<'a> Agg<'a> {
             let dense = events.len() >= 256 && self.ctx.wlen < 1 << 33;
             if dense {
                 self.dense.group(events, self.ctx.wlen, self.ctx.cat_bits);
+            } else if self.presorted {
             } else if events.len() <= 128 && self.simd_sort {
                 time_sort::small(events);
             } else {
@@ -1358,7 +1363,13 @@ fn main() {
         let dims = load_dims(&data);
         let events = list_csvs(&data.join("events"));
         let clicks = list_csvs(&data.join("clicks"));
-        (dims, events, clicks)
+        // Recovering the ID keys overlaps the link table build.
+        let keys = if std::env::var("SS_GX").as_deref() != Ok("0") {
+            gx::infer(&data, &events, timing)
+        } else {
+            None
+        };
+        (dims, events, clicks, keys)
     };
     let build_links = |workers| load_links(&list_csvs(&data.join("links")), workers);
     let (inputs, links) = if threads == 1 {
@@ -1370,7 +1381,7 @@ fn main() {
             (inputs.join().expect("prepare inputs"), links)
         })
     };
-    let ((products, campaigns, unknown, dims), event_files, click_files) = inputs;
+    let ((products, campaigns, unknown, dims), event_files, click_files, gx_keys) = inputs;
     lap("setup+links");
 
     let cat_bits = (usize::BITS - dims.cat_names.len().leading_zeros()).max(1);
@@ -1409,6 +1420,30 @@ fn main() {
         linked_pay,
         small_link_table,
     };
+
+    // Generator-aware path (gx.rs): needs both ID keys, a window that fits
+    // 32-bit millisecond offsets and categories that fit next to a price in
+    // 32 bits. It returns `None`, having written nothing, when the input does
+    // not follow the generator's ordering.
+    if wlen + WEEK < u64::from(u32::MAX) && cat_bits <= 8 {
+        if let Some(keys) = gx_keys {
+            if let Some((user_rows, total)) = gx::run(
+                &ctx, &dims, keys, &event_files, &click_files, threads, w1, &user_dir, timing,
+            ) {
+                let day0 = w0.div_euclid(DAY as i64);
+                let ndays = ((w1 - 1).div_euclid(DAY as i64) - day0 + 1).max(1) as usize;
+                let camp_rows = write_campaign_file(&camp_dir, &dims, ndays, day0 as i32, &total);
+                if timing {
+                    eprintln!("{:>10} {:>8.1} ms", "total", started.elapsed().as_secs_f64() * 1e3);
+                }
+                eprintln!("wrote user_daily={user_rows} campaign_daily={camp_rows} threads={threads} gx");
+                std::process::exit(0);
+            }
+            if timing {
+                eprintln!("  gx: input not ordered by user number, general path");
+            }
+        }
+    }
 
     // Parse and scatter.
     let chunk = env_usize("SS_CHUNK").unwrap_or(2 << 20).max(4096);

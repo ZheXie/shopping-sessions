@@ -98,6 +98,50 @@ struct Extended {
     ingest: i64,
 }
 
+/// `e` + 32 lowercase hex digits keeps its exact 128-bit value instead of a
+/// copy of its bytes. The record starts like `Extended` (low half, ingest),
+/// so ingest comparisons read both forms alike; the high half follows.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Hex {
+    lo: u64,
+    ingest: i64,
+    hi: u64,
+}
+
+/// Marks a 128-bit hex ID in a partition word and in an extended key body.
+const HEX: u64 = 1 << 62;
+
+/// The 128-bit value of 32 lowercase hex digits at `p`, if they all are.
+#[inline(always)]
+unsafe fn hex128(p: *const u8) -> Option<(u64, u64)> {
+    use std::arch::x86_64::*;
+    let x = _mm256_loadu_si256(p.cast());
+    let d = _mm256_sub_epi8(x, _mm256_set1_epi8(b'0' as i8));
+    let l = _mm256_sub_epi8(x, _mm256_set1_epi8(b'a' as i8));
+    let is_digit = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+    let is_letter = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+    if _mm256_movemask_epi8(_mm256_or_si256(is_digit, is_letter)) != -1 {
+        return None;
+    }
+    let nibbles = _mm256_blendv_epi8(d, _mm256_add_epi8(l, _mm256_set1_epi8(10)), is_letter);
+    // Each 16-bit lane: first digit * 16 + second digit.
+    let pairs = _mm256_maddubs_epi16(nibbles, _mm256_set1_epi16(0x0110));
+    let bytes = _mm256_packus_epi16(pairs, pairs);
+    Some((
+        _mm256_extract_epi64::<0>(bytes) as u64,
+        _mm256_extract_epi64::<2>(bytes) as u64,
+    ))
+}
+
+#[inline(always)]
+fn hex_hash(hi: u64, lo: u64) -> u64 {
+    let mut h = (hi ^ lo.rotate_left(32)).wrapping_mul(MIX);
+    h ^= h >> 29;
+    h = h.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h ^ (h >> 32)
+}
+
 impl Layout {
     pub fn new(parts: usize) -> Self {
         let quotient_bits = 48 - parts.trailing_zeros();
@@ -124,10 +168,11 @@ impl Layout {
     /// The high partition bits plus the low quotient uniquely determine the
     /// mixed 48-bit key. Other IDs use the original exact representation and
     /// mark their partition with INDIRECT to distinguish the two alphabets.
+    /// Returns (id, partition word, high half of a hex ID or 0).
     #[inline(always)]
     pub unsafe fn identify(
         self, p: *const u8, len: usize, stable: impl FnOnce() -> *const u8,
-    ) -> (u64, u64) {
+    ) -> (u64, u64, u64) {
         if *p == b'e' && len.wrapping_sub(1) <= 8 {
             let bytes = r8(p.add(1));
             let head = if len == 9 {
@@ -140,10 +185,19 @@ impl Layout {
                 let bits = _pext_u64(head, SIX_BITS);
                 let mixed = bits.wrapping_mul(MIX) & MASK48;
                 let key = mixed ^ (mixed >> 24);
-                return (key & self.quotient_mask, key >> self.quotient_bits);
+                return (key & self.quotient_mask, key >> self.quotient_bits, 0);
             }
         }
-        self.generic(p, len, stable)
+        if len == 33 && *p == b'e' {
+            if let Some((lo, hi)) = hex128(p.add(1)) {
+                let h = hex_hash(hi, lo);
+                let probe_bits = u64::from(h as u32) << HASH_SHIFT;
+                let part = (h >> crate::PART_SHIFT) & self.part_mask as u64;
+                return (lo, INDIRECT | HEX | probe_bits | part, hi);
+            }
+        }
+        let (id, part) = self.generic(p, len, stable);
+        (id, part, 0)
     }
 
     #[cold]
@@ -161,7 +215,8 @@ impl Layout {
 
     #[inline(always)]
     pub unsafe fn pack(
-        self, id: u64, partition: u64, ingest: i64, payload: u64, slab: &mut crate::sys::Slab,
+        self, id: u64, partition: u64, high: u64, ingest: i64, payload: u64,
+        slab: &mut crate::sys::Slab,
     ) -> Key {
         if partition & INDIRECT == 0 && (ingest as u64) < self.time_range {
             Key {
@@ -169,17 +224,27 @@ impl Layout {
                 payload: payload as u32,
             }
         } else {
-            self.extra(id, partition, ingest, payload, slab)
+            self.extra(id, partition, high, ingest, payload, slab)
         }
     }
 
     #[cold]
     unsafe fn extra(
-        self, id: u64, partition: u64, ingest: i64, payload: u64, slab: &mut crate::sys::Slab,
+        self, id: u64, partition: u64, high: u64, ingest: i64, payload: u64,
+        slab: &mut crate::sys::Slab,
     ) -> Key {
-        let full = slab.alloc(std::mem::size_of::<Extended>()) as *mut Extended;
-        full.write(Extended { id, ingest });
-        let offset = ((full as usize - slab.base()) / crate::sys::Arena::UNIT) as u64;
+        let full = if partition & HEX != 0 {
+            let full = slab.alloc(std::mem::size_of::<Hex>()) as *mut Hex;
+            full.write(Hex { lo: id, ingest, hi: high });
+            full as usize
+        } else {
+            let full = slab.alloc(std::mem::size_of::<Extended>()) as *mut Extended;
+            full.write(Extended { id, ingest });
+            full as usize
+        };
+        let offset = ((full - slab.base()) / crate::sys::Arena::UNIT) as u64;
+        // Bit 62 of the body marks a hex record, so offsets stay below 2^30.
+        assert!(offset < 1 << 30, "event key arena too large");
         // Keep the same 32-bit hash in both record forms. The high bit of
         // the offset distinguishes a generic ID from a compact ID whose
         // outlying ingest second alone needed an extension.
@@ -189,7 +254,7 @@ impl Layout {
             probe(id) as u32
         };
         Key {
-            body: (offset << 32) | u64::from(hash) | (partition & INDIRECT),
+            body: (offset << 32) | u64::from(hash) | (partition & (INDIRECT | HEX)),
             payload: EXT | payload as u32,
         }
     }
@@ -202,6 +267,14 @@ impl Layout {
         let generic = |k: Key| k.payload & EXT != 0 && k.body & INDIRECT != 0;
         if generic(a) != generic(b) {
             return false;
+        }
+        if generic(a) && (a.body | b.body) & HEX != 0 {
+            // Only two hex IDs can be equal; their hash bits match first.
+            if (a.body ^ b.body) & (HEX | 0xffff_ffff) != 0 {
+                return false;
+            }
+            let (x, y) = (a.hex(base), b.hex(base));
+            return x.lo == y.lo && x.hi == y.hi;
         }
         let id = |k: Key| {
             if k.payload & EXT == 0 {
@@ -231,9 +304,19 @@ impl Layout {
 
 impl Key {
     #[inline(always)]
+    fn record(self, base: usize) -> usize {
+        let offset = ((self.body & !(INDIRECT | HEX)) >> 32) as usize;
+        base + offset * crate::sys::Arena::UNIT
+    }
+
+    #[inline(always)]
     unsafe fn full(self, base: usize) -> Extended {
-        let offset = ((self.body & !INDIRECT) >> 32) as usize;
-        *((base + offset * crate::sys::Arena::UNIT) as *const Extended)
+        *(self.record(base) as *const Extended)
+    }
+
+    #[inline(always)]
+    unsafe fn hex(self, base: usize) -> Hex {
+        *(self.record(base) as *const Hex)
     }
 
     #[inline(always)]
@@ -260,6 +343,17 @@ mod tests {
         let ids: &[&[u8]] = &[
             b"e", b"e0", b"e00", b"e12345678", b"e `~\x7f", b"eA", b"e\0", b"e123456789",
             "猫".as_bytes(),
+            b"e0123456789abcdef0123456789abcdef",
+            b"e0123456789abcdef0123456789abcdee",
+            b"f0123456789abcdef0123456789abcdef",
+            b"e00000000000000000000000000000000",
+            b"e00000000000000000000000000000001",
+            b"e10000000000000000000000000000000",
+            b"effffffffffffffffffffffffffffffff",
+            b"e0123456789ABCDEF0123456789abcdef",
+            b"e0123456789abcdef0123456789abcdeg",
+            b"e0123456789abcdef0123456789abcde",
+            b"e0123456789abcdef0123456789abcdef0",
         ];
         let buffers: Vec<_> = ids.iter().map(|id| {
             let mut buffer = id.to_vec();
@@ -273,10 +367,12 @@ mod tests {
             let mut rows = Vec::new();
             for (i, id) in ids.iter().enumerate() {
                 let p = buffers[i].as_ptr();
-                let (key, partition) = unsafe { layout.identify(p, id.len(), || p) };
+                let (key, partition, high) = unsafe { layout.identify(p, id.len(), || p) };
+                assert_eq!(partition & HEX != 0, i >= 9 && i < 16 && i != 11, "{i}");
                 for &time in &times {
                     let payload = 0x7fff_ffff - i as u64;
-                    let row = unsafe { layout.pack(key, partition, time, payload, &mut slab) };
+                    let row =
+                        unsafe { layout.pack(key, partition, high, time, payload, &mut slab) };
                     assert_eq!(row.payload(), payload as usize);
                     rows.push((i, partition as usize & (parts - 1), time, row));
                 }

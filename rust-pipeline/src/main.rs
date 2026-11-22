@@ -98,6 +98,8 @@ struct Ctx {
 struct EvStage {
     eh: u64,
     part: u64,
+    /// High half of a 128-bit hex event ID.
+    hi: u64,
     ingest: i64,
     link_group: usize,
     name: Name,
@@ -374,7 +376,7 @@ unsafe fn event_row(
     }
     let ep = base.add(b0 as usize);
     let elen = (e0 - b0) as usize;
-    let (eh, eh2) = ctx
+    let (eh, eh2, ehi) = ctx
         .key_layout
         .identify(ep, elen, || sys::stable_id(&mut w.ids, ep, elen));
     let t = w
@@ -401,6 +403,7 @@ unsafe fn event_row(
     let s = w.ev.get_unchecked_mut(w.nev);
     s.eh = eh;
     s.part = eh2;
+    s.hi = ehi;
     s.ingest = ingest - ctx.ingest_origin;
     s.valid = valid;
     if valid {
@@ -445,7 +448,7 @@ unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
             };
             pay = ((at - ctx.arena.base) / Arena::UNIT) as u64;
         }
-        let key = ctx.key_layout.pack(s.eh, s.part, s.ingest, pay, &mut w.key_slab);
+        let key = ctx.key_layout.pack(s.eh, s.part, s.hi, s.ingest, pay, &mut w.key_slab);
         w.keys.push(s.part as usize & ctx.ev_mask, &mut w.key_slab, key);
     }
     w.nev = 0;
@@ -1364,6 +1367,101 @@ fn main() {
         })
         .min(256);
     let data = env_path("DATA_DIR", "/data");
+    // Queue the uncached part of the input into the page cache at once, in
+    // the order the phases read it (links, dimensions, events, clicks). On a
+    // cold cache the device sees several deep queues instead of one 256 KB
+    // pread per worker. A file whose sampled pages are all resident is
+    // skipped, so a warm cache costs a few mincore calls and nothing else.
+    if std::env::var("SS_PREFETCH").as_deref() != Ok("0") {
+        let data = data.clone();
+        let lanes = env_usize("SS_PREFETCH_LANES").unwrap_or(4).max(1);
+        std::thread::spawn(move || {
+            let mut files: Vec<PathBuf> = Vec::new();
+            for sub in ["links", "events", "clicks"] {
+                if let Ok(rd) = fs::read_dir(data.join(sub)) {
+                    let mut v: Vec<PathBuf> = rd.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+                    v.sort();
+                    files.extend(v);
+                }
+                if sub == "links" {
+                    files.push(data.join("products.csv"));
+                    files.push(data.join("campaigns.csv"));
+                }
+            }
+            // Samples 16 pages at the start, a third, two thirds and the end.
+            let resident = |f: &fs::File, len: usize| -> bool {
+                const PG: usize = 4096;
+                unsafe {
+                    let m = libc::mmap(
+                        std::ptr::null_mut(),
+                        len,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED,
+                        std::os::fd::AsRawFd::as_raw_fd(f),
+                        0,
+                    );
+                    if m == libc::MAP_FAILED {
+                        return false;
+                    }
+                    let npages = len.div_ceil(PG);
+                    let mut vec = [0u8; 16];
+                    let mut all = true;
+                    for k in 0..4usize {
+                        let first = npages.saturating_sub(16) * k / 3;
+                        let n = 16.min(npages - first);
+                        let addr = (m as usize + first * PG) as *mut libc::c_void;
+                        if libc::mincore(addr, n * PG, vec.as_mut_ptr()) != 0
+                            || vec[..n].iter().any(|&b| b & 1 == 0)
+                        {
+                            all = false;
+                            break;
+                        }
+                    }
+                    libc::munmap(m, len);
+                    all
+                }
+            };
+            // Split each cold file into 8 MB pieces and hand the pieces out
+            // in order, so the lanes stay on the same region of the input.
+            const PIECE: i64 = 8 << 20;
+            let mut pieces: Vec<(usize, i64)> = Vec::new();
+            let mut opened: Vec<fs::File> = Vec::new();
+            for p in &files {
+                if let Ok(f) = fs::File::open(p) {
+                    let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
+                    if len == 0 || resident(&f, len) {
+                        continue;
+                    }
+                    let mut off = 0;
+                    while off < len as i64 {
+                        pieces.push((opened.len(), off));
+                        off += PIECE;
+                    }
+                    opened.push(f);
+                }
+            }
+            if pieces.is_empty() {
+                return;
+            }
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for _ in 0..lanes {
+                    s.spawn(|| loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(&(fi, off)) = pieces.get(i) else { break };
+                        unsafe {
+                            libc::posix_fadvise(
+                                std::os::fd::AsRawFd::as_raw_fd(&opened[fi]),
+                                off,
+                                PIECE,
+                                libc::POSIX_FADV_WILLNEED,
+                            );
+                        }
+                    });
+                }
+            });
+        });
+    }
     let out_dir = env_path("OUTPUT_DIR", "/output");
     let user_dir = out_dir.join("user_daily");
     let camp_dir = out_dir.join("campaign_daily");
@@ -1492,6 +1590,7 @@ fn main() {
         let blank_ev = EvStage {
             eh: 0,
             part: 0,
+            hi: 0,
             ingest: 0,
             link_group: 0,
             name: 0,

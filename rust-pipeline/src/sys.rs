@@ -391,11 +391,23 @@ struct Cursor {
     end: usize,
 }
 
+/// The partition's current output line, plus room for a record that runs
+/// into the next line.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Stage([u8; 128]);
+
 /// One cursor per partition keeps the next store and its block boundary
 /// together. Record addresses never change, so dedup can invalidate a
 /// payload in place even after its writer has moved on to another block.
+///
+/// Thousands of partitions defeat the CPU's write combining, so every store
+/// to a fresh line would first read that line from memory. Records gather in
+/// a cache-resident copy of their line instead, and each full line goes out
+/// with streaming stores. `finish` writes the partial lines and fences.
 pub struct PartWriter<T> {
     cursors: Vec<Cursor>,
+    stages: Vec<Stage>,
     blocks: Vec<Vec<Blk>>,
     _record: PhantomData<T>,
 }
@@ -403,8 +415,10 @@ pub struct PartWriter<T> {
 impl<T: Copy> PartWriter<T> {
     pub fn new(parts: usize) -> Self {
         assert_eq!(BLOCK_BYTES % std::mem::size_of::<T>(), 0);
+        assert!(std::mem::size_of::<T>() <= 64);
         PartWriter {
             cursors: vec![Cursor::default(); parts],
+            stages: vec![Stage([0; 128]); parts],
             blocks: (0..parts).map(|_| Vec::new()).collect(),
             _record: PhantomData,
         }
@@ -412,13 +426,25 @@ impl<T: Copy> PartWriter<T> {
 
     #[inline(always)]
     pub unsafe fn push(&mut self, part: usize, slab: &mut Slab, value: T) -> usize {
+        use std::arch::x86_64::*;
         let mut cursor = *self.cursors.get_unchecked(part);
         if cursor.next == cursor.end {
             cursor = self.new_block(part, slab);
         }
-        (cursor.next as *mut T).write(value);
         let at = cursor.next;
+        let stage = self.stages.as_mut_ptr().add(part) as *mut u8;
+        (stage.add(at & 63) as *mut T).write_unaligned(value);
         cursor.next += std::mem::size_of::<T>();
+        if (cursor.next ^ at) & !63 != 0 {
+            // The line holding `at` is complete: every byte of it has been
+            // staged, because blocks are line aligned and records tile them.
+            let line = (at & !63) as *mut __m256i;
+            let s = stage as *mut __m256i;
+            _mm256_stream_si256(line, _mm256_load_si256(s));
+            _mm256_stream_si256(line.add(1), _mm256_load_si256(s.add(1)));
+            _mm256_store_si256(s, _mm256_load_si256(s.add(2)));
+            _mm256_store_si256(s.add(1), _mm256_load_si256(s.add(3)));
+        }
         *self.cursors.get_unchecked_mut(part) = cursor;
         at
     }
@@ -426,6 +452,12 @@ impl<T: Copy> PartWriter<T> {
     #[cold]
     #[inline(never)]
     fn new_block(&mut self, part: usize, slab: &mut Slab) -> Cursor {
+        // Line aligned, so streaming stores cover whole lines; back-to-back
+        // blocks still start 63 lines apart.
+        if slab.end - slab.cur < BLOCK_BYTES + 63 {
+            slab.grow(BLOCK_BYTES + 63);
+        }
+        slab.cur += slab.cur.wrapping_neg() & 63;
         let ptr = slab.alloc(BLOCK_BYTES);
         self.blocks[part].push(Blk {
             ptr,
@@ -438,11 +470,24 @@ impl<T: Copy> PartWriter<T> {
     }
 
     pub fn finish(mut self) -> Vec<Vec<Blk>> {
-        for (blocks, cursor) in self.blocks.iter_mut().zip(self.cursors) {
+        for (part, (blocks, cursor)) in self.blocks.iter_mut().zip(&self.cursors).enumerate() {
             if let Some(last) = blocks.last_mut() {
                 last.n = ((cursor.next - last.ptr) / std::mem::size_of::<T>()) as u32;
+                let partial = cursor.next & 63;
+                if partial != 0 {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            self.stages[part].0.as_ptr(),
+                            (cursor.next & !63) as *mut u8,
+                            partial,
+                        );
+                    }
+                }
             }
         }
+        // Streaming stores are weakly ordered; publish them before the
+        // blocks reach other threads.
+        unsafe { std::arch::x86_64::_mm_sfence() };
         self.blocks
     }
 }

@@ -92,14 +92,18 @@ struct Ctx {
     linked_parts: usize,
     linked_pay: LinkedPay,
     small_link_table: bool,
+    alias_parts: usize,
 }
 
 #[derive(Clone, Copy)]
 struct EvStage {
     eh: u64,
     part: u64,
+    /// High half of a 128-bit hex event ID.
+    hi: u64,
     ingest: i64,
-    link_group: usize,
+    /// `name_hash` of the raw user ID; it picks the alias partition.
+    hash: u64,
     name: Name,
     tp: u64,
     valid: bool,
@@ -107,20 +111,23 @@ struct EvStage {
 
 #[derive(Clone, Copy)]
 struct ClStage {
-    link_group: usize,
+    hash: u64,
     name: Name,
     click: Click,
 }
 
+/// Parsing files each valid event and click under its raw user ID's alias
+/// partition: a contiguous range of link-table groups. Identity is resolved
+/// after dedup, one alias partition at a time, so a worker probes only a
+/// cache-sized slice of the table instead of missing to memory on every row.
 struct Work<'a> {
     slab: Slab<'a>,
     key_slab: Slab<'a>,
     /// Copies of IDs too long to pack, kept until exit.
     ids: Slab<'a>,
     keys: PartWriter<Key>,
-    pays: PartWriter<Pay>,
-    compact: PartWriter<u64>,
-    clks: PartWriter<Clk>,
+    pend: PartWriter<Pay>,
+    pend_clks: PartWriter<Clk>,
     ev: [EvStage; BATCH],
     nev: usize,
     cl: [ClStage; BATCH],
@@ -374,7 +381,7 @@ unsafe fn event_row(
     }
     let ep = base.add(b0 as usize);
     let elen = (e0 - b0) as usize;
-    let (eh, eh2) = ctx
+    let (eh, eh2, ehi) = ctx
         .key_layout
         .identify(ep, elen, || sys::stable_id(&mut w.ids, ep, elen));
     let t = w
@@ -401,15 +408,15 @@ unsafe fn event_row(
     let s = w.ev.get_unchecked_mut(w.nev);
     s.eh = eh;
     s.part = eh2;
+    s.hi = ehi;
     s.ingest = ingest - ctx.ingest_origin;
     s.valid = valid;
     if valid {
         let up = base.add(f[1].0 as usize);
-        // The bytes stay in the read buffer until routing decides whether
-        // the name escapes; only then is it copied.
+        // A long name stays in the read buffer until the flush copies it.
         let (name, h) = links::name_hashed(up, user_len, || up);
         s.name = name;
-        s.link_group = ctx.links.prefetch(h);
+        s.hash = h;
         let mut cat = 0;
         if price != 0 {
             let pp = base.add(f[5].0 as usize);
@@ -424,28 +431,24 @@ unsafe fn event_row(
     }
 }
 
+/// The alias partition of a raw name's hash. `Table::first_slot` scales the
+/// same hash, so one partition probes one contiguous range of groups.
+#[inline(always)]
+fn alias_part(ctx: &Ctx, hash: u64) -> usize {
+    ((hash as u128 * ctx.alias_parts as u128) >> 64) as usize
+}
+
 #[inline(never)]
 unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
-    for i in 0..w.nev {
-        let s = w.ev.get_unchecked(i);
-        if s.valid {
-            ctx.links.prefetch_bytes(s.link_group, s.name);
-        }
-    }
     for i in 0..w.nev {
         let s = *w.ev.get_unchecked(i);
         let mut pay = 0u64;
         if s.valid {
-            let (name, part) = route(ctx, s.link_group, s.name, &mut w.ids);
-            let at = if part < ctx.linked_parts {
-                let encoded = ctx.linked_pay.encode(name - 1, s.tp, &mut w.slab, &ctx.arena);
-                w.compact.push(part, &mut w.slab, encoded)
-            } else {
-                w.pays.push(part - ctx.linked_parts, &mut w.slab, Pay { name, w: s.tp })
-            };
+            let name = links::keep_name(s.name, |p, len| sys::stable_id(&mut w.ids, p, len));
+            let at = w.pend.push(alias_part(ctx, s.hash), &mut w.slab, Pay { name, w: s.tp });
             pay = ((at - ctx.arena.base) / Arena::UNIT) as u64;
         }
-        let key = ctx.key_layout.pack(s.eh, s.part, s.ingest, pay, &mut w.key_slab);
+        let key = ctx.key_layout.pack(s.eh, s.part, s.hi, s.ingest, pay, &mut w.key_slab);
         w.keys.push(s.part as usize & ctx.ev_mask, &mut w.key_slab, key);
     }
     w.nev = 0;
@@ -478,8 +481,8 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 4
     let s = w.cl.get_unchecked_mut(w.ncl);
     let (name, h) = links::name_hashed(up, user_len, || up);
     s.name = name;
-    s.link_group = ctx.links.prefetch(h);
-    s.click =Click::new(rel, camp, kp, klen, || sys::stable_id(&mut w.ids, kp, klen));
+    s.hash = h;
+    s.click = Click::new(rel, camp, kp, klen, || sys::stable_id(&mut w.ids, kp, klen));
     w.ncl += 1;
     if w.ncl == BATCH {
         flush_clicks(ctx, w);
@@ -489,33 +492,110 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 4
 #[inline(never)]
 unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
     for i in 0..w.ncl {
-        let s = w.cl.get_unchecked(i);
-        ctx.links.prefetch_bytes(s.link_group, s.name);
-    }
-    for i in 0..w.ncl {
         let s = *w.cl.get_unchecked(i);
-        let (name, part) = route(ctx, s.link_group, s.name, &mut w.ids);
-        w.clks.push(
-            part,
-            &mut w.slab,
-            Clk {
-                name,
-                click: s.click,
-            },
-        );
+        let name = links::keep_name(s.name, |p, len| sys::stable_id(&mut w.ids, p, len));
+        w.pend_clks.push(alias_part(ctx, s.hash), &mut w.slab, Clk { name, click: s.click });
     }
     w.ncl = 0;
 }
 
+/// Per-worker output of identity resolution: records filed by person.
+struct Router<'a> {
+    slab: Slab<'a>,
+    pays: PartWriter<Pay>,
+    compact: PartWriter<u64>,
+    clks: PartWriter<Clk>,
+}
+
+/// One resolution step per raw name: three passes over a batch so the
+/// misses on long names' bytes and on stored names overlap.
+#[derive(Clone, Copy, Default)]
+struct Pending {
+    name: Name,
+    word: u64,
+    group: usize,
+}
+
 #[inline(always)]
-unsafe fn route(ctx: &Ctx, group: usize, raw: Name, ids: &mut Slab) -> (Name, usize) {
+unsafe fn locate(ctx: &Ctx, batch: &mut [Pending]) {
+    for p in batch.iter_mut() {
+        p.group = ctx.links.prefetch(name_hash(p.name));
+    }
+    for p in batch.iter() {
+        ctx.links.prefetch_bytes(p.group, p.name);
+    }
+}
+
+/// Every name here is already stable (inline, or a copy in the ID arena).
+#[inline(always)]
+unsafe fn route(ctx: &Ctx, group: usize, raw: Name) -> (Name, usize) {
     // A tiny links file can accompany arbitrarily large event files.
     // Its group number has too few bits to balance unlinked people then.
     let hash = if ctx.small_link_table { (name_hash(raw) >> 32) as usize } else { group };
     let fallback = ctx.linked_parts + (hash & ctx.person_mask);
-    ctx.links.route_keep(group, raw, fallback, |n| {
-        links::keep_name(n, |p, len| sys::stable_id(&mut *ids, p, len))
-    })
+    ctx.links.route_keep(group, raw, fallback, |n| n)
+}
+
+#[inline(never)]
+unsafe fn route_events(ctx: &Ctx, r: &mut Router, batch: &mut [Pending]) {
+    locate(ctx, batch);
+    for p in batch.iter() {
+        let (name, part) = route(ctx, p.group, p.name);
+        if part < ctx.linked_parts {
+            let encoded = ctx.linked_pay.encode(name - 1, p.word, &mut r.slab, &ctx.arena);
+            r.compact.push(part, &mut r.slab, encoded);
+        } else {
+            r.pays.push(part - ctx.linked_parts, &mut r.slab, Pay { name, w: p.word });
+        }
+    }
+}
+
+#[inline(never)]
+unsafe fn route_clicks(ctx: &Ctx, r: &mut Router, batch: &mut [Pending], clicks: &[Click]) {
+    locate(ctx, batch);
+    for (p, &click) in batch.iter().zip(clicks) {
+        let (name, part) = route(ctx, p.group, p.name);
+        r.clks.push(part, &mut r.slab, Clk { name, click });
+    }
+}
+
+/// Resolves one alias partition: live events (dedup zeroed the others'
+/// names) and all clicks move to their person's partition.
+unsafe fn resolve_part(ctx: &Ctx, r: &mut Router, pays: &[Blk], clks: &[Blk]) {
+    let mut batch = [Pending::default(); BATCH];
+    let mut n = 0;
+    for (b, blk) in pays.iter().enumerate() {
+        prefetch_block(pays.get(b + 1));
+        for p in std::slice::from_raw_parts(blk.ptr as *const Pay, blk.n as usize) {
+            if p.name == 0 {
+                continue;
+            }
+            links::prefetch_name(p.name);
+            *batch.get_unchecked_mut(n) = Pending { name: p.name, word: p.w, group: 0 };
+            n += 1;
+            if n == BATCH {
+                route_events(ctx, r, &mut batch);
+                n = 0;
+            }
+        }
+    }
+    route_events(ctx, r, &mut batch[..n]);
+    let mut clicks = [Click::default(); BATCH];
+    n = 0;
+    for (b, blk) in clks.iter().enumerate() {
+        prefetch_block(clks.get(b + 1));
+        for c in std::slice::from_raw_parts(blk.ptr as *const Clk, blk.n as usize) {
+            links::prefetch_name(c.name);
+            *batch.get_unchecked_mut(n) = Pending { name: c.name, word: 0, group: 0 };
+            *clicks.get_unchecked_mut(n) = c.click;
+            n += 1;
+            if n == BATCH {
+                route_clicks(ctx, r, &mut batch, &clicks);
+                n = 0;
+            }
+        }
+    }
+    route_clicks(ctx, r, &mut batch[..n], &clicks[..n]);
 }
 
 /// Blocks of a partition are scattered, so the hardware prefetcher loses the
@@ -1415,6 +1495,11 @@ fn main() {
     let person_parts = unlinked_parts + linked_parts;
     let linked_pay = LinkedPay::new(links.shift(), wlen, cat_bits);
     let small_link_table = links.groups() < unlinked_parts;
+    // About 64 KB of link groups per alias partition, so a worker's probes
+    // stay in its L2.
+    let alias_parts = env_usize("SS_ALIAS_PARTS")
+        .unwrap_or_else(|| (links.groups() / 1024).next_power_of_two())
+        .clamp(64, MAX_PARTS);
     let key_layout = event_key::Layout::new(ev_parts);
     let ctx = Ctx {
         key_layout,
@@ -1432,6 +1517,7 @@ fn main() {
         linked_parts,
         linked_pay,
         small_link_table,
+        alias_parts,
     };
 
     // Generator-aware path (gx.rs): needs both ID keys, a window that fits
@@ -1492,14 +1578,15 @@ fn main() {
         let blank_ev = EvStage {
             eh: 0,
             part: 0,
+            hi: 0,
             ingest: 0,
-            link_group: 0,
+            hash: 0,
             name: 0,
             tp: 0,
             valid: false,
         };
         let blank_cl = ClStage {
-            link_group: 0,
+            hash: 0,
             name: 0,
             click: Click::default(),
         };
@@ -1508,9 +1595,8 @@ fn main() {
             key_slab: Slab::new(&key_arena),
             ids: Slab::new(id_arena),
             keys: PartWriter::new(ev_parts),
-            pays: PartWriter::new(unlinked_parts),
-            compact: PartWriter::new(linked_parts),
-            clks: PartWriter::new(person_parts),
+            pend: PartWriter::new(alias_parts),
+            pend_clks: PartWriter::new(alias_parts),
             ev: [blank_ev; BATCH],
             nev: 0,
             cl: [blank_cl; BATCH],
@@ -1567,19 +1653,17 @@ fn main() {
                 }
             }
         }
-        let mut pays = w.compact.finish();
-        pays.extend(w.pays.finish());
-        (w.keys.finish(), pays, w.clks.finish())
+        (w.keys.finish(), w.pend.finish(), w.pend_clks.finish())
     });
-    let (mut keys, mut pays, mut clks) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut keys, mut pend, mut pend_clks) = (Vec::new(), Vec::new(), Vec::new());
     for (k, p, c) in scattered {
         keys.push(k);
-        pays.push(p);
-        clks.push(c);
+        pend.push(p);
+        pend_clks.push(c);
     }
     let keys = merge_blocks(keys, ev_parts);
-    let pays = merge_blocks(pays, person_parts);
-    let clks = merge_blocks(clks, person_parts);
+    let pend = merge_blocks(pend, alias_parts);
+    let pend_clks = merge_blocks(pend_clks, alias_parts);
     lap("parse");
 
     // Dedup.
@@ -1597,6 +1681,35 @@ fn main() {
     // The last dedup worker has joined and its key pointers are no longer live.
     unsafe { key_arena.recycle() };
     lap("dedup");
+
+    // Resolve identities, one alias partition at a time, largest first.
+    let mut alias_order: Vec<usize> = (0..alias_parts).collect();
+    alias_order.sort_unstable_by_key(|&p| std::cmp::Reverse(pend[p].len() + pend_clks[p].len()));
+    let next = AtomicUsize::new(0);
+    let routed = par_map(threads, |_| {
+        let mut r = Router {
+            slab: Slab::new(&ctx.arena),
+            pays: PartWriter::new(unlinked_parts),
+            compact: PartWriter::new(linked_parts),
+            clks: PartWriter::new(person_parts),
+        };
+        while let Some(&part) = alias_order.get(next.fetch_add(1, Relaxed)) {
+            unsafe { resolve_part(&ctx, &mut r, &pend[part], &pend_clks[part]) };
+        }
+        let mut pays = r.compact.finish();
+        pays.extend(r.pays.finish());
+        (pays, r.clks.finish())
+    });
+    drop(pend);
+    drop(pend_clks);
+    let (mut pays, mut clks) = (Vec::new(), Vec::new());
+    for (p, c) in routed {
+        pays.push(p);
+        clks.push(c);
+    }
+    let pays = merge_blocks(pays, person_parts);
+    let clks = merge_blocks(clks, person_parts);
+    lap("resolve");
 
     // Start partitions containing large linked people first so their work
     // overlaps the other workers' ordinary partitions.

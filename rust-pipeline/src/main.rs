@@ -115,6 +115,8 @@ struct ClStage {
 struct Work<'a> {
     slab: Slab<'a>,
     key_slab: Slab<'a>,
+    /// Copies of IDs too long to pack, kept until exit.
+    ids: Slab<'a>,
     keys: PartWriter<Key>,
     pays: PartWriter<Pay>,
     compact: PartWriter<u64>,
@@ -358,7 +360,6 @@ unsafe fn event_row(
     ctx: &Ctx,
     w: &mut Work,
     base: *const u8,
-    source: *const u8,
     f: &[(u32, u32); 7],
 ) {
     let (b0, e0) = f[0];
@@ -371,11 +372,11 @@ unsafe fn event_row(
     if ingest == ts::BAD {
         return;
     }
-    let (eh, eh2) = ctx.key_layout.identify(
-        base.add(b0 as usize),
-        (e0 - b0) as usize,
-        source.add(b0 as usize),
-    );
+    let ep = base.add(b0 as usize);
+    let elen = (e0 - b0) as usize;
+    let (eh, eh2) = ctx
+        .key_layout
+        .identify(ep, elen, || sys::stable_id(&mut w.ids, ep, elen));
     let t = w
         .dates
         .parse(base.add(f[2].0 as usize), (f[2].1 - f[2].0) as usize);
@@ -404,7 +405,7 @@ unsafe fn event_row(
     s.valid = valid;
     if valid {
         let up = base.add(f[1].0 as usize);
-        s.name = links::name_at(up, user_len, source.add(f[1].0 as usize));
+        s.name = links::name_at(up, user_len, || sys::stable_id(&mut w.ids, up, user_len));
         s.link_group = ctx.links.prefetch(name_hash(s.name));
         let mut cat = 0;
         if price != 0 {
@@ -441,12 +442,11 @@ unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
     w.nev = 0;
 }
 
-/// `base` holds the row (possibly a reusable read buffer); `source` is the
-/// same row in the file mapping, which lives until exit. Names and click IDs
-/// that are not inline keep `source` addresses, so the read buffer can be
-/// reused; those mapped pages are only touched for the rare long IDs and ties.
+/// `base` holds the row (possibly a reusable read buffer). Names and click
+/// IDs that are not inline are copied to `w.ids`, so the read buffer can be
+/// reused and the file mapping is never touched.
 #[inline(always)]
-unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, source: *const u8, f: &[(u32, u32); 4]) {
+unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 4]) {
     let user_len = (f[1].1 - f[1].0) as usize;
     if f[0].0 == f[0].1 || user_len == 0 {
         return;
@@ -464,16 +464,12 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, source: *const u8,
         return;
     }
     let up = base.add(f[1].0 as usize);
+    let kp = base.add(f[0].0 as usize);
+    let klen = (f[0].1 - f[0].0) as usize;
     let s = w.cl.get_unchecked_mut(w.ncl);
-    s.name = links::name_at(up, user_len, source.add(f[1].0 as usize));
+    s.name = links::name_at(up, user_len, || sys::stable_id(&mut w.ids, up, user_len));
     s.link_group = ctx.links.prefetch(name_hash(s.name));
-    s.click = Click::new(
-        rel,
-        camp,
-        base.add(f[0].0 as usize),
-        (f[0].1 - f[0].0) as usize,
-        source.add(f[0].0 as usize),
-    );
+    s.click = Click::new(rel, camp, kp, klen, || sys::stable_id(&mut w.ids, kp, klen));
     w.ncl += 1;
     if w.ncl == BATCH {
         flush_clicks(ctx, w);
@@ -1364,7 +1360,8 @@ fn main() {
         let events = list_csvs(&data.join("events"));
         let clicks = list_csvs(&data.join("clicks"));
         // Recovering the ID keys overlaps the link table build.
-        let keys = if std::env::var("SS_GX").as_deref() != Ok("0") {
+        // Opaque v5 IDs defeat generator inference; the path stays opt-in.
+        let keys = if std::env::var("SS_GX").as_deref() == Ok("1") {
             gx::infer(&data, &events, timing)
         } else {
             None
@@ -1466,6 +1463,8 @@ fn main() {
     }
     let next = AtomicUsize::new(0);
     let key_arena = Arena::new();
+    // Long IDs are copied here and referenced until exit.
+    let id_arena: &'static Arena = Box::leak(Box::new(Arena::new()));
     let scattered = par_map(threads, |_| {
         let mut sc = Scan::new();
         let mut reader = sys::EventReader::default();
@@ -1486,6 +1485,7 @@ fn main() {
         let mut w = Work {
             slab: Slab::new(&ctx.arena),
             key_slab: Slab::new(&key_arena),
+            ids: Slab::new(id_arena),
             keys: PartWriter::new(ev_parts),
             pays: PartWriter::new(unlinked_parts),
             compact: PartWriter::new(linked_parts),
@@ -1506,7 +1506,7 @@ fn main() {
                 // Large files: line boundaries are found in the read buffer,
                 // so the mapping is not touched (no faults, no page-table
                 // entries to tear down at exit).
-                let (input, start, len) = if buffered && buf.can_pread && buf.len >= 256 << 10 {
+                let (input, _, len) = if buffered && buf.can_pread && buf.len >= 256 << 10 {
                     reader.read_lines(path, buf, a, b)
                 } else {
                     let start = scan::line_start(buf.ptr, buf.len, a);
@@ -1517,19 +1517,17 @@ fn main() {
                 if len == 0 {
                     continue;
                 }
-                let source = buf.ptr.add(start);
                 let mut pos = 0;
                 while pos < len {
                     let next = sc.scan(input, len, pos, (pos + sub).min(len));
                     let base = input.add(pos);
-                    let mapped = source.add(pos);
                     if is_click {
                         scan::rows::<4, _>(&sc, len - pos, |fields| {
-                            click_row(&ctx, &mut w, base, mapped, fields)
+                            click_row(&ctx, &mut w, base, fields)
                         });
                     } else {
                         scan::rows::<7, _>(&sc, len - pos, |fields| {
-                            event_row(&ctx, &mut w, base, mapped, fields)
+                            event_row(&ctx, &mut w, base, fields)
                         });
                     }
                     pos = next;

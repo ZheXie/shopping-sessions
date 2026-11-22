@@ -23,7 +23,7 @@ const PAD: [u64; 9] = {
 /// bijections on those bits, so the mixed key doubles as its own hash.
 /// Longer / non-ASCII IDs use a tagged pointer and a proper byte comparison.
 #[inline(always)]
-unsafe fn encode(p: *const u8, len: usize, source: *const u8) -> (u64, u64) {
+unsafe fn encode(p: *const u8, len: usize, stable: impl FnOnce() -> *const u8) -> (u64, u64) {
     let bytes = r8(p);
     let (head, last) = if len == 9 {
         (bytes, *p.add(8))
@@ -31,10 +31,10 @@ unsafe fn encode(p: *const u8, len: usize, source: *const u8) -> (u64, u64) {
         let pad = *PAD.get_unchecked(len);
         ((bytes & !pad) | (0x2c2c_2c2c_2c2c_2c2c & pad), b',')
     } else {
-        return indirect(p, len, source);
+        return indirect(p, len, stable);
     };
     if (head & !ASCII) != 0 || last >= 128 {
-        return indirect(p, len, source);
+        return indirect(p, len, stable);
     }
     let v = _pext_u64(head, ASCII) | ((last as u64) << 56);
     let mixed = (v ^ (v >> 31)).wrapping_mul(MIX) & !INDIRECT;
@@ -42,10 +42,10 @@ unsafe fn encode(p: *const u8, len: usize, source: *const u8) -> (u64, u64) {
     (key, key)
 }
 
-#[cold]
-unsafe fn indirect(p: *const u8, len: usize, source: *const u8) -> (u64, u64) {
+#[inline(always)]
+unsafe fn indirect(p: *const u8, len: usize, stable: impl FnOnce() -> *const u8) -> (u64, u64) {
     let h = hash(p, len);
-    (INDIRECT | ((h & 0x7fff) << 48) | source as u64, h)
+    (INDIRECT | ((h & 0x7fff) << 48) | stable() as u64, h)
 }
 
 /// Hash bits for the partition-local table. An indirect key carries a
@@ -122,7 +122,9 @@ impl Layout {
     /// mixed 48-bit key. Other IDs use the original exact representation and
     /// mark their partition with INDIRECT to distinguish the two alphabets.
     #[inline(always)]
-    pub unsafe fn identify(self, p: *const u8, len: usize, source: *const u8) -> (u64, u64) {
+    pub unsafe fn identify(
+        self, p: *const u8, len: usize, stable: impl FnOnce() -> *const u8,
+    ) -> (u64, u64) {
         if *p == b'e' && len.wrapping_sub(1) <= 8 {
             let bytes = r8(p.add(1));
             let head = if len == 9 {
@@ -138,13 +140,15 @@ impl Layout {
                 return (key & self.quotient_mask, key >> self.quotient_bits);
             }
         }
-        self.generic(p, len, source)
+        self.generic(p, len, stable)
     }
 
     #[cold]
     #[inline(never)]
-    unsafe fn generic(self, p: *const u8, len: usize, source: *const u8) -> (u64, u64) {
-        let (id, hash) = encode(p, len, source);
+    unsafe fn generic(
+        self, p: *const u8, len: usize, stable: impl FnOnce() -> *const u8,
+    ) -> (u64, u64) {
+        let (id, hash) = encode(p, len, stable);
         (id, INDIRECT | ((hash >> crate::PART_SHIFT) & self.part_mask as u64))
     }
 
@@ -248,7 +252,7 @@ mod tests {
         let buffers: Vec<_> = ids.iter().map(|id| {
             let mut buffer = id.to_vec();
             buffer.push(b',');
-            buffer.resize(buffer.len() + 16, 0);
+            buffer.resize(buffer.len() + 64, 0);
             buffer
         }).collect();
         for parts in [1, 32, 512, 4096] {
@@ -257,7 +261,7 @@ mod tests {
             let mut rows = Vec::new();
             for (i, id) in ids.iter().enumerate() {
                 let p = buffers[i].as_ptr();
-                let (key, partition) = unsafe { layout.identify(p, id.len(), p) };
+                let (key, partition) = unsafe { layout.identify(p, id.len(), || p) };
                 for &time in &times {
                     let payload = 0x7fff_ffff - i as u64;
                     let row = unsafe { layout.pack(key, partition, time, payload, &mut slab) };

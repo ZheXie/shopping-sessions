@@ -15,14 +15,28 @@ const INLINE: u64 = 0x80;
 const ASCII: u64 = 0x7f7f_7f7f_7f7f_7f7f;
 const LENGTH_BITS: u64 = 0x0000_0080_8080_8000;
 
+/// An ID that is not packed, up to its comma, quote or newline. It lives in
+/// an input buffer (`SLACK` readable bytes past the final newline) or an ID
+/// copy in an arena, so whole 32-byte loads past the terminator are safe.
 #[inline(always)]
 pub unsafe fn id_bytes<'a>(p: u64) -> &'a [u8] {
     let p = p as *const u8;
+    let comma = _mm256_set1_epi8(b',' as i8);
+    let quote = _mm256_set1_epi8(b'"' as i8);
+    let newline = _mm256_set1_epi8(b'\n' as i8);
     let mut n = 0;
-    while !matches!(*p.add(n), b',' | b'"' | b'\n') {
-        n += 1;
+    loop {
+        let v = _mm256_loadu_si256(p.add(n) as *const __m256i);
+        let hit = _mm256_or_si256(
+            _mm256_or_si256(_mm256_cmpeq_epi8(v, comma), _mm256_cmpeq_epi8(v, quote)),
+            _mm256_cmpeq_epi8(v, newline),
+        );
+        let bits = _mm256_movemask_epi8(hit) as u32;
+        if bits != 0 {
+            return std::slice::from_raw_parts(p, n + bits.trailing_zeros() as usize);
+        }
+        n += 32;
     }
-    std::slice::from_raw_parts(p, n)
 }
 
 const PACK: [(u64, u64); 9] = {
@@ -48,15 +62,16 @@ const PACK: [(u64, u64); 9] = {
 
 /// `u` followed by up to eight ASCII bytes fits in one word. Spare high
 /// bits record the exact length (including embedded NULs). Other IDs refer
-/// to the original, unquoted bytes in the input mapping.
+/// to stable, unquoted bytes: the links mapping or a parser's ID copy.
 #[inline(always)]
 pub unsafe fn name_of(p: *const u8, len: usize) -> Name {
-    name_at(p, len, p)
+    name_at(p, len, || p)
 }
 
-/// The bytes at `p` may be in a reusable buffer; `source` lives until exit.
+/// The bytes at `p` may be in a reusable buffer; `stable` gives a copy that
+/// lives until exit and is only called for names that are not inline.
 #[inline(always)]
-pub unsafe fn name_at(p: *const u8, len: usize, source: *const u8) -> Name {
+pub unsafe fn name_at(p: *const u8, len: usize, stable: impl FnOnce() -> *const u8) -> Name {
     if len.wrapping_sub(1) <= 8 && *p == b'u' {
         let (mask, tag) = *PACK.get_unchecked(len - 1);
         let word = r8(p.add(1)) & mask;
@@ -64,7 +79,19 @@ pub unsafe fn name_at(p: *const u8, len: usize, source: *const u8) -> Name {
             return word | tag;
         }
     }
-    (source as u64) << 8
+    let print = (hash(p, len) >> 8) & 0x7f;
+    ((stable() as u64) << 8) | (print << PRINT_SHIFT)
+}
+
+// An indirect name keeps its 48-bit address above the low byte and seven
+// hash bits above that (not the high hash bits, which choose the probe
+// group), so most comparisons of different long names never load them.
+const PRINT_SHIFT: u32 = 56;
+const PRINT: u64 = 0x7f << PRINT_SHIFT;
+
+#[inline(always)]
+fn addr(n: Name) -> u64 {
+    (n >> 8) & ADDR
 }
 
 #[inline(always)]
@@ -89,7 +116,8 @@ pub fn same_name(a: Name, b: Name) -> bool {
         || ((a | b) & INLINE == 0
             && a != 0
             && b != 0
-            && unsafe { id_bytes(a >> 8) == id_bytes(b >> 8) })
+            && (a ^ b) & PRINT == 0
+            && unsafe { id_bytes(addr(a)) == id_bytes(addr(b)) })
 }
 
 #[inline(always)]
@@ -98,7 +126,7 @@ pub fn name_hash(n: Name) -> u64 {
         return (n ^ n.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     }
     unsafe {
-        let bytes = id_bytes(n >> 8);
+        let bytes = id_bytes(addr(n));
         hash(bytes.as_ptr(), bytes.len())
     }
 }
@@ -118,7 +146,7 @@ pub fn write_name(n: Name, out: &mut Vec<u8>) {
             out.set_len(start + 4 + len);
         }
     } else {
-        let bytes = unsafe { id_bytes(n >> 8) };
+        let bytes = unsafe { id_bytes(addr(n)) };
         out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         out.extend_from_slice(bytes);
     }
@@ -133,7 +161,7 @@ unsafe fn compare_names(a: Name, b: Name) -> Ordering {
             .then_with(|| inline_len(a).cmp(&inline_len(b)));
     }
     if a & INLINE != 0 {
-        let right = id_bytes(b >> 8);
+        let right = id_bytes(addr(b));
         return b'u'
             .cmp(&right[0])
             .then_with(|| (a & ASCII).to_le_bytes()[..inline_len(a) - 1].cmp(&right[1..]));
@@ -141,7 +169,7 @@ unsafe fn compare_names(a: Name, b: Name) -> Ordering {
     if b & INLINE != 0 {
         return compare_names(b, a).reverse();
     }
-    id_bytes(a >> 8).cmp(id_bytes(b >> 8))
+    id_bytes(addr(a)).cmp(id_bytes(addr(b)))
 }
 
 pub type Edge = (Name, Name);
@@ -509,10 +537,16 @@ mod tests {
     fn independent_names_share_slots_by_bytes_and_overflow_consistently() {
         let linked = unsafe { name_of(b"u00000000".as_ptr(), 9) };
         let table = Table::build(&[vec![(linked, linked)]], 1);
-        let copies: Vec<Vec<u8>> = (0..8).map(|_| b"long individual name,".to_vec()).collect();
+        let copies: Vec<Vec<u8>> = (0..8)
+            .map(|_| {
+                let mut copy = b"long individual name,".to_vec();
+                copy.resize(copy.len() + 64, 0);
+                copy
+            })
+            .collect();
         let barrier = std::sync::Barrier::new(copies.len());
         let routes = par_map(copies.len(), |i| unsafe {
-            let raw = name_of(copies[i].as_ptr(), copies[i].len() - 1);
+            let raw = name_of(copies[i].as_ptr(), 20);
             barrier.wait();
             table.unlinked(0, raw, usize::MAX)
         });
@@ -521,7 +555,7 @@ mod tests {
         assert!(routes.iter().all(|r| *r == routes[0]));
         unsafe {
             let canonical = table.canonical((part << table.shift()) + local as usize - 1);
-            assert_eq!(id_bytes(canonical >> 8), b"long individual name");
+            assert_eq!(id_bytes(addr(canonical)), b"long individual name");
             let second = name_of(b"u00000001".as_ptr(), 9);
             let third = name_of(b"u00000002".as_ptr(), 9);
             // An alias probe can cross this group without affecting the saved

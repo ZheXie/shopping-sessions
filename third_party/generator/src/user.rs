@@ -6,7 +6,7 @@ use crate::plan::{
 };
 use crate::random::{Random, Stream};
 use crate::text::{
-    DAY, HOUR, MINUTE, SECOND, bad_timestamp, base36, scramble, valid_timestamp, write_utc,
+    DAY, HOUR, MINUTE, SECOND, bad_timestamp, opaque, scramble, valid_timestamp, write_utc,
 };
 
 /// Room for each person's alias numbers in the 40 bits `scramble` mixes.
@@ -120,7 +120,7 @@ struct User<'a> {
 /// The ID for a number: `u` and base 36, scrambled so no ID says whose it is.
 fn user_id(dataset: &Dataset, number: u64) -> Vec<u8> {
     let mut id = b"u".to_vec();
-    base36(&mut id, scramble(number, dataset.user_key));
+    opaque(&mut id, number, dataset.user_key);
     id
 }
 
@@ -310,7 +310,7 @@ impl<'a> User<'a> {
 
         row.field(|out| {
             out.push(b'e');
-            base36(out, scramble(index, dataset.event_key));
+            opaque(out, index, dataset.event_key);
         });
         if random.chance(rates.case_variant) {
             row.uppercase_last();
@@ -459,7 +459,7 @@ impl<'a> User<'a> {
         row.clear();
         row.field(|out| {
             out.push(b'k');
-            base36(out, scramble(index, dataset.click_key));
+            opaque(out, index, dataset.click_key);
         });
         if random.chance(rates.case_variant) {
             row.uppercase_last();

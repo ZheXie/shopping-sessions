@@ -15,17 +15,19 @@ pub struct Click {
 impl Click {
     /// The packed event window leaves at least 24 spare timestamp bits, and
     /// the dimension loader checks that campaign indices fit in 16 bits.
-    /// `p` has SIMD slack; `source` points to the same ID in the stable CSV.
+    /// `p` has SIMD slack; `stable` gives a copy of the ID that lives until
+    /// exit and is only called for IDs that do not pack.
     #[inline(always)]
     pub unsafe fn new(
         time: u64,
         campaign: u32,
         p: *const u8,
         len: usize,
-        source: *const u8,
+        stable: impl FnOnce() -> *const u8,
     ) -> Self {
         debug_assert!(len != 0);
-        let id = if len <= 9 && *p.add(len - 1) != 0 {
+        let mut packed = None;
+        if len <= 9 && *p.add(len - 1) != 0 {
             let bytes = r8(p);
             let head = if len < 8 {
                 bytes & (u64::MAX >> (64 - len * 8))
@@ -34,12 +36,12 @@ impl Click {
             };
             let tail = if len == 9 { *p.add(8) } else { 0 };
             if (head & !ASCII) == 0 && tail < 128 {
-                (_pext_u64(head.swap_bytes(), ASCII) << 7) | tail as u64
-            } else {
-                INDIRECT | source as u64
+                packed = Some((_pext_u64(head.swap_bytes(), ASCII) << 7) | tail as u64);
             }
-        } else {
-            INDIRECT | source as u64
+        }
+        let id = match packed {
+            Some(id) => id,
+            None => INDIRECT | stable() as u64,
         };
         Self {
             time_campaign: (time << 16) | u64::from(campaign),
@@ -95,15 +97,15 @@ mod tests {
         let csv: Vec<Vec<u8>> = ids.iter().map(|id| {
             let mut buf = id.to_vec();
             buf.push(b',');
-            buf.resize(buf.len() + 16, 0);
+            buf.resize(buf.len() + 64, 0);
             buf
         }).collect();
         for (i, id) in ids.iter().enumerate() {
             let t = (1 << 36) + i as u64;
-            let a = unsafe { Click::new(t, 59_999, csv[i].as_ptr(), id.len(), csv[i].as_ptr()) };
+            let a = unsafe { Click::new(t, 59_999, csv[i].as_ptr(), id.len(), || csv[i].as_ptr()) };
             assert_eq!((a.time(), a.campaign()), (t, 59_999));
             for (j, other) in ids.iter().enumerate() {
-                let b = unsafe { Click::new(t, 0, csv[j].as_ptr(), other.len(), csv[j].as_ptr()) };
+                let b = unsafe { Click::new(t, 0, csv[j].as_ptr(), other.len(), || csv[j].as_ptr()) };
                 assert_eq!(unsafe { a.precedes(b) }, id < other, "{id:?} vs {other:?}");
             }
         }

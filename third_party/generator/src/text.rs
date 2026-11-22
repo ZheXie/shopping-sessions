@@ -205,6 +205,33 @@ pub fn base36(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&buffer[at..]);
 }
 
+fn mix64(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Like the scorer's v5 IDs: a keyed bijection on 40 bits in base 36, and a
+/// 32-character hex suffix on one in eight distinct values. Only the profile
+/// build reads these, so the exact keyed mix does not need to match.
+pub fn opaque(out: &mut Vec<u8>, value: u64, key: u64) {
+    const MASK: u64 = (1 << 40) - 1;
+    let mut m = scramble(value, key);
+    m = (m.wrapping_mul(mix64(key) | 1)) & MASK;
+    m ^= m >> 19;
+    m = (m ^ (mix64(key ^ 7) & MASK)).wrapping_mul(0x5851_F42D_4C95_7F2D) & MASK;
+    base36(out, m);
+    let h = mix64(value ^ key.rotate_left(17));
+    if h % 8 == 0 {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for word in [mix64(h ^ 1), mix64(h ^ 2)] {
+            for i in (0..16).rev() {
+                out.push(HEX[((word >> (i * 4)) & 15) as usize]);
+            }
+        }
+    }
+}
+
 /// A bijection on `0..2^40`, so IDs look random and never collide. Multiplying
 /// by an odd number and xor-shifting right are each invertible modulo 2^40, so
 /// any odd multipliers would do; these two are fixed so IDs never change.

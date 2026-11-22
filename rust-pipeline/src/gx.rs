@@ -607,7 +607,7 @@ unsafe fn user_word(key: u64, p: *const u8, len: usize, source: *const u8) -> u6
     if n != u64::MAX {
         (n << 8) | REG
     } else {
-        links::name_at(p, len, source)
+        links::name_at(p, len, || source)
     }
 }
 
@@ -669,7 +669,7 @@ unsafe fn ev_row(g: &G, w: &mut GWork, base: *const u8, source: *const u8, f: &[
                 let word = if n != u64::MAX {
                     (n << 8) | REG
                 } else {
-                    links::name_at(up, user_len, source.add(f[1].0 as usize))
+                    links::name_at(up, user_len, || source.add(f[1].0 as usize))
                 };
                 w.side.push(word);
                 (
@@ -726,7 +726,7 @@ unsafe fn ck_row(g: &G, w: &mut GWork, base: *const u8, source: *const u8, f: &[
         camp,
         base.add(f[0].0 as usize),
         (f[0].1 - f[0].0) as usize,
-        source.add(f[0].0 as usize),
+        || source.add(f[0].0 as usize),
     );
     let up = base.add(f[1].0 as usize);
     let n = user_number(up, user_len, g.keys.user);
@@ -734,7 +734,7 @@ unsafe fn ck_row(g: &G, w: &mut GWork, base: *const u8, source: *const u8, f: &[
         let u = n >> 9;
         w.max_u = w.max_u.max(u);
         if bit(&g.cx_users, u as usize) {
-            let (canonical, root) = g.resolve(links::name_at(up, user_len, up));
+            let (canonical, root) = g.resolve(links::name_at(up, user_len, || up));
             if root.is_some_and(|r| bit(&g.cx_roots, r)) {
                 w.xclk.push(
                     xpart(canonical),
@@ -756,7 +756,7 @@ unsafe fn ck_row(g: &G, w: &mut GWork, base: *const u8, source: *const u8, f: &[
             },
         );
     } else {
-        let (canonical, _) = g.resolve(links::name_at(up, user_len, source.add(f[1].0 as usize)));
+        let (canonical, _) = g.resolve(links::name_at(up, user_len, || source.add(f[1].0 as usize)));
         w.xclk.push(
             xpart(canonical),
             &mut w.slab,

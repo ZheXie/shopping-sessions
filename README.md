@@ -6,6 +6,39 @@ Exact ETL for dirty click-stream logs → two daily Parquet tables. Fastest corr
 **Plan:** [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md)  
 **Track:** https://www.joinbuilders.org/buildathon/tracks/shopping-sessions
 
+## Opaque IDs (scorer `shopping-sessions-5`)
+
+The rescored track passes every ID through a per-seed keyed bijection and
+gives one in eight distinct user, event and click IDs a 32-character hex
+suffix. Those IDs do not fit a word, and the general path used to keep
+pointers to them in the file mapping. With one long ID in eight, that touched
+nearly every page of the input (RSS 2.4 GB on 20M events) and left them all to
+tear down at exit (about 100 ms between the last lap and process exit).
+
+- Each parser copies IDs that do not pack into its own slab of a dedicated
+  arena (`sys::stable_id`), so the input is only ever read through the pread
+  buffer and the mapping is never touched.
+- `links::id_bytes` finds the end of an ID with 32-byte AVX2 compares instead
+  of a byte loop (it was 16% of all samples).
+- An indirect `Name` carries seven hash bits above its address, so different
+  long names compare unequal without loading their bytes.
+- The generator in `third_party/generator`, used only for the profile-guided
+  build, emits the same shape of IDs so the profile covers these paths.
+- The generator-aware path cannot apply to opaque IDs; it is now opt-in
+  (`SS_GX=1`) and skips its key inference by default.
+
+20M events in that shape (emulated generator, seed 11), 8 vCPUs, interleaved,
+min/median ms:
+
+| build | parse | total | wall |
+| --- | --- | --- | --- |
+| before (`20fce38`, the general path of `c925b6e`) | 230/236 | 334/335 | 431/434 |
+| after | 176/181 | 259/270 | 272/283 |
+
+On four cores the wall time went from 718/757 to 513/540 ms. Output matches
+the Python reference on the 1M set in that shape, and fixtures, the public dev
+answer and seeds 2–3 still match.
+
 ## Generator-aware path (`rust-pipeline/src/gx.rs`)
 
 The public generator names events `e` + base36(scramble(index)) and users

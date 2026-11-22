@@ -308,6 +308,19 @@ impl<'a> Slab<'a> {
     }
 }
 
+/// Copies an ID that does not fit a word into `slab`, followed by a comma
+/// so `id_bytes` finds its end. One in eight IDs is long, so pointing back
+/// into the file mapping would fault in nearly every page of the input and
+/// leave all of them to tear down at exit; the copies are dense instead.
+#[cold]
+#[inline(never)]
+pub unsafe fn stable_id(slab: &mut Slab, p: *const u8, len: usize) -> *const u8 {
+    let dst = slab.alloc(len + 1) as *mut u8;
+    std::ptr::copy_nonoverlapping(p, dst, len);
+    *dst.add(len) = b',';
+    dst
+}
+
 /// Backs `[ptr, ptr + len)` with zeroed memory now. A region first touched by
 /// a read is mapped to the shared zero page and then never gets huge pages;
 /// writing it first does.

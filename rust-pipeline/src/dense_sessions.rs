@@ -229,7 +229,7 @@ mod tests {
             let campaign = i % 3;
             let id = ids[campaign + (i % 2) * 3].as_ptr();
             unsafe {
-                clicks.push(Click::new(time, campaign as u32, id, 2, id));
+                clicks.push(Click::new(time, campaign as u32, id, 2, || id));
             }
         }
         unsafe fn eligible(clicks: &[Click], start: u64) -> (Option<(u64, usize)>, u32) {

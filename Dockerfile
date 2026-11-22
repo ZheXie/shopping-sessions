@@ -14,5 +14,7 @@ FROM debian:bookworm-slim
 RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
 COPY --from=builder /src/rust-pipeline/target/release/shopping-sessions /app/shopping-sessions
 WORKDIR /app
+# Variant for the scorer: parse the file mapping and release pages as it goes.
+ENV SS_READ=mmap SS_REL=1
 # The binary reads DATA_DIR / OUTPUT_DIR / NCPU itself; no shell in between.
 CMD ["/app/shopping-sessions"]

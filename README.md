@@ -22,6 +22,15 @@ tear down at exit (about 100 ms between the last lap and process exit).
   of a byte loop (it was 16% of all samples).
 - An indirect `Name` carries seven hash bits above its address, so different
   long names compare unequal without loading their bytes.
+- Equal long names still need one byte comparison against the stored copy.
+  Each 32-row flush first prefetches the stored names whose fingerprint
+  matches, so those misses overlap.
+- A parser hashes a long user ID once (for the fingerprint and the link
+  probe) and copies it with two 32-byte moves instead of a `memcpy` call.
+- Long event IDs give the dedup table 32 real hash bits, carried in spare
+  bits of the partition word. With only the 15-bit fingerprint, thousands of
+  long keys per partition shared probe slots and each false match loaded two
+  extension records and both IDs.
 - The generator in `third_party/generator`, used only for the profile-guided
   build, emits the same shape of IDs so the profile covers these paths.
 - The generator-aware path cannot apply to opaque IDs; it is now opt-in
@@ -33,9 +42,11 @@ min/median ms:
 | build | parse | total | wall |
 | --- | --- | --- | --- |
 | before (`20fce38`, the general path of `c925b6e`) | 230/236 | 334/335 | 431/434 |
-| after | 176/181 | 259/270 | 272/283 |
+| arena, AVX2 `id_bytes`, name fingerprints (`879f314`) | 176/181 | 259/270 | 272/283 |
+| prefetch, one hash, dedup hash bits | 163/166 | 242/246 | 253/258 |
 
-On four cores the wall time went from 718/757 to 513/540 ms. Output matches
+On four cores the wall time went from 718/757 to 513/540 ms at `879f314`
+and to 453/493 ms now. `879f314` scored 0.7631 s on the practice board. Output matches
 the Python reference on the 1M set in that shape, and fixtures, the public dev
 answer and seeds 2–3 still match.
 

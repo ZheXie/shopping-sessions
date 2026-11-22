@@ -312,12 +312,27 @@ impl<'a> Slab<'a> {
 /// so `id_bytes` finds its end. One in eight IDs is long, so pointing back
 /// into the file mapping would fault in nearly every page of the input and
 /// leave all of them to tear down at exit; the copies are dense instead.
-#[cold]
-#[inline(never)]
+/// `p` has `SLACK` readable bytes, so a short ID moves as two 32-byte
+/// halves; the slab keeps room for the whole 64 bytes before the next ID
+/// overwrites the tail.
+#[inline]
 pub unsafe fn stable_id(slab: &mut Slab, p: *const u8, len: usize) -> *const u8 {
-    let dst = slab.alloc(len + 1) as *mut u8;
-    std::ptr::copy_nonoverlapping(p, dst, len);
+    use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_storeu_si256};
+    const WIDE: usize = 64;
+    if slab.end - slab.cur < len + WIDE {
+        slab.grow(len + WIDE);
+    }
+    let dst = slab.cur as *mut u8;
+    if len < WIDE {
+        let lo = _mm256_loadu_si256(p as *const __m256i);
+        let hi = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        _mm256_storeu_si256(dst as *mut __m256i, lo);
+        _mm256_storeu_si256(dst.add(32) as *mut __m256i, hi);
+    } else {
+        std::ptr::copy_nonoverlapping(p, dst, len);
+    }
     *dst.add(len) = b',';
+    slab.cur += len + 1;
     dst
 }
 

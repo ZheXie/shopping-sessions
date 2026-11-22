@@ -405,8 +405,9 @@ unsafe fn event_row(
     s.valid = valid;
     if valid {
         let up = base.add(f[1].0 as usize);
-        s.name = links::name_at(up, user_len, || sys::stable_id(&mut w.ids, up, user_len));
-        s.link_group = ctx.links.prefetch(name_hash(s.name));
+        let (name, h) = links::name_hashed(up, user_len, || sys::stable_id(&mut w.ids, up, user_len));
+        s.name = name;
+        s.link_group = ctx.links.prefetch(h);
         let mut cat = 0;
         if price != 0 {
             let pp = base.add(f[5].0 as usize);
@@ -423,6 +424,12 @@ unsafe fn event_row(
 
 #[inline(never)]
 unsafe fn flush_events(ctx: &Ctx, w: &mut Work) {
+    for i in 0..w.nev {
+        let s = w.ev.get_unchecked(i);
+        if s.valid {
+            ctx.links.prefetch_bytes(s.link_group, s.name);
+        }
+    }
     for i in 0..w.nev {
         let s = *w.ev.get_unchecked(i);
         let mut pay = 0u64;
@@ -467,9 +474,10 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 4
     let kp = base.add(f[0].0 as usize);
     let klen = (f[0].1 - f[0].0) as usize;
     let s = w.cl.get_unchecked_mut(w.ncl);
-    s.name = links::name_at(up, user_len, || sys::stable_id(&mut w.ids, up, user_len));
-    s.link_group = ctx.links.prefetch(name_hash(s.name));
-    s.click = Click::new(rel, camp, kp, klen, || sys::stable_id(&mut w.ids, kp, klen));
+    let (name, h) = links::name_hashed(up, user_len, || sys::stable_id(&mut w.ids, up, user_len));
+    s.name = name;
+    s.link_group = ctx.links.prefetch(h);
+    s.click =Click::new(rel, camp, kp, klen, || sys::stable_id(&mut w.ids, kp, klen));
     w.ncl += 1;
     if w.ncl == BATCH {
         flush_clicks(ctx, w);
@@ -478,6 +486,10 @@ unsafe fn click_row(ctx: &Ctx, w: &mut Work, base: *const u8, f: &[(u32, u32); 4
 
 #[inline(never)]
 unsafe fn flush_clicks(ctx: &Ctx, w: &mut Work) {
+    for i in 0..w.ncl {
+        let s = w.cl.get_unchecked(i);
+        ctx.links.prefetch_bytes(s.link_group, s.name);
+    }
     for i in 0..w.ncl {
         let s = *w.cl.get_unchecked(i);
         let (name, part) = route(ctx, s.link_group, s.name);

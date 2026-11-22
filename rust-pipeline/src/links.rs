@@ -72,15 +72,30 @@ pub unsafe fn name_of(p: *const u8, len: usize) -> Name {
 /// lives until exit and is only called for names that are not inline.
 #[inline(always)]
 pub unsafe fn name_at(p: *const u8, len: usize, stable: impl FnOnce() -> *const u8) -> Name {
+    name_hashed(p, len, stable).0
+}
+
+/// `name_at` and the name's `name_hash`, hashing a long name's bytes once.
+#[inline(always)]
+pub unsafe fn name_hashed(
+    p: *const u8, len: usize, stable: impl FnOnce() -> *const u8,
+) -> (Name, u64) {
     if len.wrapping_sub(1) <= 8 && *p == b'u' {
         let (mask, tag) = *PACK.get_unchecked(len - 1);
         let word = r8(p.add(1)) & mask;
         if word & !ASCII == 0 {
-            return word | tag;
+            let n = word | tag;
+            return (n, inline_hash(n));
         }
     }
-    let print = (hash(p, len) >> 8) & 0x7f;
-    ((stable() as u64) << 8) | (print << PRINT_SHIFT)
+    let h = hash(p, len);
+    let print = (h >> 8) & 0x7f;
+    (((stable() as u64) << 8) | (print << PRINT_SHIFT), h)
+}
+
+#[inline(always)]
+fn inline_hash(n: Name) -> u64 {
+    (n ^ n.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15)
 }
 
 // An indirect name keeps its 48-bit address above the low byte and seven
@@ -123,7 +138,7 @@ pub fn same_name(a: Name, b: Name) -> bool {
 #[inline(always)]
 pub fn name_hash(n: Name) -> u64 {
     if n & INLINE != 0 {
-        return (n ^ n.rotate_left(29)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        return inline_hash(n);
     }
     unsafe {
         let bytes = id_bytes(addr(n));
@@ -211,6 +226,31 @@ impl Table {
             _mm_prefetch(self.groups.add(group).cast(), _MM_HINT_T0);
         }
         group
+    }
+
+    /// Starts loading the bytes of stored long names in `name`'s first probe
+    /// group whose fingerprint matches, so verifying a batch of long names
+    /// overlaps those misses instead of taking them one after another.
+    #[inline(always)]
+    pub unsafe fn prefetch_bytes(&self, group: usize, name: Name) {
+        if name & INLINE != 0 || self.cap == 0 {
+            return;
+        }
+        let g = &*self.groups.add(group);
+        let print = name & PRINT;
+        let fetch = |k: Name| {
+            if k != 0 && k & (INLINE | PRINT) == print {
+                let p = addr(k) as *const i8;
+                _mm_prefetch(p, _MM_HINT_T0);
+                _mm_prefetch(p.add(40), _MM_HINT_T0);
+            }
+        };
+        for lane in 0..4 {
+            fetch(g.keys[lane].load(Relaxed));
+        }
+        for lane in 0..2 {
+            fetch(g.unlinked[lane].load(Relaxed) & !OVERFLOW);
+        }
     }
 
     #[inline(always)]

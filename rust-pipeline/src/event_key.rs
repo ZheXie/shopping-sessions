@@ -73,6 +73,9 @@ const SIX_BITS: u64 = 0x5f5f_5f5f_5f5f_5f5f;
 const FIXED: u64 = 0xa0a0_a0a0_a0a0_a0a0;
 const EXPECTED: u64 = 0x2020_2020_2020_2020;
 const EXT: u32 = 1 << 31;
+/// Where a generic ID's partition word keeps its probe hash (above the
+/// partition index, which `MAX_PARTS` keeps below 16 bits).
+const HASH_SHIFT: u32 = 16;
 
 #[derive(Clone, Copy)]
 pub struct Layout {
@@ -149,7 +152,11 @@ impl Layout {
         self, p: *const u8, len: usize, stable: impl FnOnce() -> *const u8,
     ) -> (u64, u64) {
         let (id, hash) = encode(p, len, stable);
-        (id, INDIRECT | ((hash >> crate::PART_SHIFT) & self.part_mask as u64))
+        // Bits 16..48 of the partition word carry 32 hash bits for the
+        // dedup table: the 15-bit fingerprint in a long ID's word alone
+        // made thousands of long keys in a partition share probe slots.
+        let probe_bits = u64::from(hash as u32) << HASH_SHIFT;
+        (id, INDIRECT | probe_bits | ((hash >> crate::PART_SHIFT) & self.part_mask as u64))
     }
 
     #[inline(always)]
@@ -176,8 +183,13 @@ impl Layout {
         // Keep the same 32-bit hash in both record forms. The high bit of
         // the offset distinguishes a generic ID from a compact ID whose
         // outlying ingest second alone needed an extension.
+        let hash = if partition & INDIRECT != 0 {
+            (partition >> HASH_SHIFT) as u32
+        } else {
+            probe(id) as u32
+        };
         Key {
-            body: (offset << 32) | u64::from(probe(id) as u32) | (partition & INDIRECT),
+            body: (offset << 32) | u64::from(hash) | (partition & INDIRECT),
             payload: EXT | payload as u32,
         }
     }

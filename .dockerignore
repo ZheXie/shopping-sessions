@@ -5,8 +5,9 @@ scratch/
 *.md
 .git
 dev-answer/
-third_party/
 pipeline/
-scripts/
+scripts/*
+!scripts/build_pgo.sh
+third_party/generator/target/
 target/
 rust-pipeline/target/

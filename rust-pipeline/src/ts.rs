@@ -1,6 +1,7 @@
 //! Timestamps: F1 `2026-10-03T23:58:10Z`, F2 `...+HH:MM`, F3 epoch millis.
 
-use crate::hashx::r8;
+use crate::hashx::{decimal8, r8};
+use std::arch::x86_64::*;
 
 pub const BAD: i64 = i64::MIN;
 pub const DAY_MS: i64 = 86_400_000;
@@ -17,12 +18,12 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 
 const SLOTS: usize = 128;
 
-/// Memo of `YYYY-MM-DD` text to the UTC ms of that midnight. A dataset only
+/// Memo of `YYYY-MM-DD` text to the UTC epoch seconds of that midnight. A dataset only
 /// holds a few dozen dates, so the calendar arithmetic runs once per date.
 pub struct Dates {
     head: [u64; SLOTS],
     tail: [u16; SLOTS],
-    ms: [i64; SLOTS],
+    seconds: [i64; SLOTS],
 }
 
 impl Dates {
@@ -30,7 +31,7 @@ impl Dates {
         Dates {
             head: [0; SLOTS],
             tail: [0; SLOTS],
-            ms: [BAD; SLOTS],
+            seconds: [BAD; SLOTS],
         }
     }
 
@@ -62,27 +63,47 @@ impl Dates {
         if day > len {
             return BAD;
         }
-        let ms = days_from_civil(y, m, day) * DAY_MS;
+        let seconds = days_from_civil(y, m, day) * (DAY_MS / 1000);
         self.head[slot] = r8(p);
         self.tail[slot] = (p.add(8) as *const u16).read_unaligned();
-        self.ms[slot] = ms;
-        ms
+        self.seconds[slot] = seconds;
+        seconds
     }
 
-    /// `YYYY-MM-DDTHH:MM:SS` at `p` (19 readable bytes) as UTC ms, or `BAD`.
+    /// UTC midnight in epoch seconds, or `BAD`.
     #[inline(always)]
-    unsafe fn datetime(&mut self, p: *const u8) -> i64 {
+    unsafe fn midnight(&mut self, p: *const u8) -> i64 {
         let head = r8(p);
         let tail = (p.add(8) as *const u16).read_unaligned();
         // Low bits of the day's two digits and of the month's last digit.
         let slot =
             (((tail >> 8) & 0xF) | ((tail & 3) << 4) | (((head >> 48) as u16 & 1) << 6)) as usize;
-        let day =
-            if *self.head.get_unchecked(slot) == head && *self.tail.get_unchecked(slot) == tail {
-                *self.ms.get_unchecked(slot)
-            } else {
-                self.miss(p, slot)
-            };
+        if *self.head.get_unchecked(slot) == head && *self.tail.get_unchecked(slot) == tail {
+            *self.seconds.get_unchecked(slot)
+        } else {
+            self.miss(p, slot)
+        }
+    }
+
+    /// Every ingest timestamp in a well-formed event is a valid F1 per the
+    /// input contract. Decode its six clock digits without testing them again.
+    #[inline(always)]
+    pub unsafe fn ingest_seconds(&mut self, p: *const u8, len: usize) -> i64 {
+        if len != 20 {
+            return BAD;
+        }
+        let day = self.midnight(p);
+        if day == BAD {
+            return BAD;
+        }
+        let x = r8(p.add(11)) ^ 0x3030_3A30_303A_3030;
+        let y = x.wrapping_mul(2561);
+        day + (((y >> 8) & 255) * 3600 + ((y >> 32) & 255) * 60 + (y >> 56)) as i64
+    }
+
+    #[inline(always)]
+    unsafe fn datetime(&mut self, p: *const u8) -> i64 {
+        let day = self.midnight(p);
         // `HH:MM:SS` at once: after the xor a digit byte is 0..=9 and a colon
         // byte is 0; adding 0x76 (or 0x7F) sets the top bit of any other.
         let x = r8(p.add(11)) ^ 0x3030_3A30_303A_3030;
@@ -93,12 +114,15 @@ impl Dates {
         if (bad != 0) | (*p.add(10) != b'T') | (h > 23) | (m > 59) | (s > 59) | (day == BAD) {
             return BAD;
         }
-        day + ((h * 3600 + m * 60 + s) * 1000) as i64
+        (day + (h * 3600 + m * 60 + s) as i64) * 1000
     }
 
     /// Epoch milliseconds, or `BAD`. Needs 25 readable bytes at `p`.
     #[inline(always)]
     pub unsafe fn parse(&mut self, p: *const u8, len: usize) -> i64 {
+        if len == 13 {
+            return thirteen(p);
+        }
         if len == 20 {
             if *p.add(19) == b'Z' {
                 return self.datetime(p);
@@ -136,16 +160,24 @@ impl Dates {
     }
 }
 
-/// Eight ASCII digits at `p`, or `u64::MAX`.
+/// A 13-digit millisecond epoch in two groups of eight digits.
 #[inline(always)]
-unsafe fn eight(p: *const u8) -> u64 {
-    let x = r8(p) ^ 0x3030_3030_3030_3030;
-    if (x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080 != 0 {
-        return u64::MAX;
+unsafe fn thirteen(p: *const u8) -> i64 {
+    let digits = _mm_xor_si128(_mm_loadu_si128(p.cast()), _mm_set1_epi8(b'0' as i8));
+    let invalid = _mm_or_si128(digits, _mm_add_epi8(digits, _mm_set1_epi8(0x76)));
+    if _mm_movemask_epi8(invalid) & 0x1fff != 0 {
+        return BAD;
     }
-    let x = x.wrapping_mul(2561) >> 8;
-    let x = (x & 0x00FF_00FF_00FF_00FF).wrapping_mul(6_553_601) >> 16;
-    (x & 0x0000_FFFF_0000_FFFF).wrapping_mul(42_949_672_960_001) >> 32
+    // Left-pad to 16 digits. Each multiply-add groups two adjacent decimal
+    // values, first digits, then pairs, then four-digit values.
+    let padded = _mm_slli_si128::<3>(digits);
+    let pairs = _mm_maddubs_epi16(padded, _mm_set1_epi16(0x010a));
+    let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0064));
+    let packed = _mm_packs_epi32(quads, quads);
+    let octets = _mm_madd_epi16(packed, _mm_set1_epi32(0x0001_2710));
+    let leading = _mm_cvtsi128_si32(octets) as i64;
+    let trailing = _mm_extract_epi32::<1>(octets) as i64;
+    leading * 100_000_000 + trailing
 }
 
 #[inline(always)]
@@ -167,7 +199,7 @@ unsafe fn digits(p: *const u8, len: usize) -> i64 {
     if len - i >= 8 {
         end = len - 8;
         scale = 100_000_000;
-        v = eight(p.add(end));
+        v = decimal8(r8(p.add(end)) ^ 0x3030_3030_3030_3030);
         if v == u64::MAX {
             return BAD;
         }

@@ -17,3 +17,10 @@ target/
 .DS_Store
 .idea/
 .vscode/
+
+# C++ build
+build/
+
+# Rust build
+rust/target/
+!rust/.cargo/

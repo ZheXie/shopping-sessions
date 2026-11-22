@@ -7,7 +7,7 @@ FIXTURES ?= $(if $(wildcard fixtures),fixtures,../../fixtures)
 BIN ?= rust-pipeline/target/release/shopping-sessions
 export IMAGE CPUS MEM PLATFORM
 
-.PHONY: build build-local fixtures dev run-dev check-dev
+.PHONY: build build-local build-local-pgo fixtures dev run-dev check-dev
 
 ## Build the scorer image (linux/amd64)
 build:
@@ -16,6 +16,10 @@ build:
 ## Release binary for local loops (flags in rust-pipeline/.cargo/config.toml)
 build-local:
 	cd rust-pipeline && cargo build --release
+
+## Match the scorer image's profile-guided build (needs llvm-tools-preview)
+build-local-pgo:
+	sh scripts/build_pgo.sh
 
 ## Run all 36 fixtures against the local binary
 fixtures: build-local

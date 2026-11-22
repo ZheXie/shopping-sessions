@@ -2,4 +2,4 @@
 
 Name:
 Members:
-Engine: Rust (mimalloc + rayon + mmap); Python reference in pipeline/
+Engine: C++ (src/ss.cpp, static binary); Polars skeleton in pipeline/ is unused
